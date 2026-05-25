@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -25,6 +27,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/qlog"
 	"github.com/songgao/water"
 	"github.com/vishvananda/netlink"
 	"github.com/yosida95/uritemplate/v3"
@@ -35,9 +38,9 @@ import (
 	"github.com/quangtrieu1312/tmasque/utility"
 )
 
-func Bootstrap(ctx *context.Context) {
+func Bootstrap(ctx context.Context) {
     logger.LogInfo("Exec bootstrap")
-    cmd := exec.Command("/sbin/ip", "rule", "add", "not", "fwmark", (*ctx).Value("FWMARK").(string), "table", "9000")
+    cmd := exec.Command("/sbin/ip", "rule", "add", "not", "fwmark", ctx.Value("FWMARK").(string), "table", "9000")
     logger.LogInfo(fmt.Sprintf("Running command: /sbin/ip"))
     _, err := cmd.Output()
     if err != nil {
@@ -45,24 +48,30 @@ func Bootstrap(ctx *context.Context) {
     }
 }
 
-func RunPostUp() {
+func RunPostUp(ctx context.Context) {
     logger.LogInfo("Exec post up")
-	go http.ListenAndServe("localhost:6060", nil)
+	enablePerfMon, ok := ctx.Value("ENABLE_PERFORMANCE_MONITOR").(bool)
+	if !ok {
+		enablePerfMon = false
+	}
+	if enablePerfMon {
+		go http.ListenAndServe("localhost:9484", nil)
+	}
 }
 
 func GracefullyShutdown() {
     logger.LogInfo("Exec post down")
-    cmd := exec.Command("/sbin/ip", "rule", "del", "table", "9000")
-    logger.LogInfo(fmt.Sprintf("Running command: /sbin/ip"))
+    cmd := exec.Command("/bin/bash", "-c", "ip rule del table 9000", "||", "/bin/true")
+    logger.LogInfo(fmt.Sprintf("Deleting ip rule entry for table 9000"))
     _, err := cmd.Output()
     if err != nil {
-        logger.LogFatal(fmt.Sprintf("Error running post down command: %v", err))
+        logger.LogFatal(fmt.Sprintf("Cannot gracefully shutdown: %v", err))
     }
-    cmd = exec.Command("/sbin/ip", "route", "flush", "table", "9000")
-    logger.LogInfo(fmt.Sprintf("Running command: /sbin/ip"))
+    cmd = exec.Command("/bin/bash", "-c", "ip route flush table 9000", "||", "/bin/true")
+    logger.LogInfo(fmt.Sprintf("Flushing routing table 9000"))
 	_, err = cmd.Output()
     if err != nil {
-        logger.LogFatal(fmt.Sprintf("Error running post down command: %v", err))
+        logger.LogFatal(fmt.Sprintf("Cannot gracefully shutdown: %v", err))
     }
 }
 
@@ -139,7 +148,7 @@ func main() {
             case isRunning := <- isRunningChan:
                 if (isRunning) {
                     logger.LogInfo("Masque is up")
-                    RunPostUp()
+                    RunPostUp(contxt)
                 } else {
                     logger.LogInfo("Masque is down")
                     GracefullyShutdown()
@@ -149,41 +158,43 @@ func main() {
             }
         }
     }(ctx)
+    tunnelCount := 4
+    if v := ctx.Value("TUNNEL_COUNT"); v != nil {
+        if n, perr := strconv.Atoi(v.(string)); perr == nil && n > 0 {
+            tunnelCount = n
+        }
+    }
+    logger.LogInfo(fmt.Sprintf("Bonding %d parallel tunnels", tunnelCount))
     go func(contxt context.Context) {
         errorThreshold := 3
         attempt := 1
-		connID := fmt.Sprintf("conn#%d", attempt)
         for {
             if attempt >= errorThreshold {
                 errChan <- fmt.Errorf("Out of attempts")
             }
             logger.LogInfo(fmt.Sprintf("Number of retry attempts left = %d", errorThreshold - attempt))
-	        routes, localPrefixes, ipconn, err := establishMASQUEConn(ctx, serverAddr, serverHost, enableKeyLog, keyLogPath)
+	        conns, devs, err := establishAllTunnels(ctx, serverAddr, serverHost, enableKeyLog, keyLogPath, tunnelCount)
 	        if err != nil {
-                logger.LogError(fmt.Sprintf("Failed to establish MASQUE connection: %v", err))
+                logger.LogError(fmt.Sprintf("Failed to establish bonded MASQUE tunnels: %v", err))
                 attempt++
                 continue
 	        }
-            devs, derr := establishTunTapAndRoutes(ctx, routes, localPrefixes)
-            if derr != nil {
-                logger.LogError(fmt.Sprintf("Failed to establish TUN/TAP device or VPN routes: %v", derr))
-                attempt++
-                continue
-            }
-	        logger.LogDebug(fmt.Sprintf("Created TUN device: %s in the background", devs[0].Name()))
-            eChan := make(chan error, runtime.NumCPU() + 1)
+	        logger.LogDebug(fmt.Sprintf("Created TUN device: %s with %d bonded tunnels", devs[0].Name(), len(conns)))
+            eChan := make(chan error, runtime.NumCPU() + tunnelCount + 1)
 			connCtx, connCancel := context.WithCancel(ctx)
             go func() {
                 cerr := <-eChan
                 attempt++
                 logger.LogError(fmt.Sprintf("Tunneling error: %v", cerr))
 				connCancel()
-                ipconn.Close()
+				for _, c := range conns {
+					c.Close()
+				}
 				for _, dev := range devs {
 					dev.Close()
 				}
             }()
-            tunnel(connCtx, connID, ipconn, devs, isRunningChan, eChan)
+            tunnel(connCtx, conns, devs, isRunningChan, eChan)
         }
     }(ctx)
     <-ctx.Done()
@@ -196,7 +207,7 @@ func healthCheck(ctx context.Context) error {
     return nil
 }
 
-func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverFQDN string, enableKeyLog bool, keyLogPath string) ([]connectip.IPRoute, []netip.Prefix, *connectip.Conn, error) {
+func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverFQDN string, enableKeyLog bool, keyLogPath string, tunIdx, tunCount int) ([]connectip.IPRoute, []netip.Prefix, *connectip.Conn, error) {
     fwmark, err := strconv.ParseInt(ctx.Value("FWMARK").(string), 10, 32)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to parse FWMARK config to number: %w", err)
@@ -274,6 +285,8 @@ func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverF
     		MaxStreamReceiveWindow:         10 * 1024 * 1024,  // 10 MB
     		InitialConnectionReceiveWindow: 15 * 1024 * 1024,  // 15 MB
     		MaxConnectionReceiveWindow:     15 * 1024 * 1024,  // 15 MB
+    		// Per-connection qlog (CWND/RTT/loss) — active only when QLOGDIR is set.
+    		Tracer: qlog.DefaultConnectionTracer,
 		},
 	)
 	if err != nil {
@@ -284,7 +297,13 @@ func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverF
 	hconn := tr.NewClientConn(conn)
 
 	template := uritemplate.MustNew(fmt.Sprintf("https://tmasqued:%d/vpn", serverAddr.Port()))
-	ipconn, rsp, err := connectip.Dial(dialCtx, hconn, template)
+	// Bonded-tunnel coordinates (Model A): the server uses these to slot this
+	// tunnel into the client's session group and to symmetric-hash return flows.
+	hdrs := http.Header{
+		"Tmasqued-Tunnel-Index": []string{strconv.Itoa(tunIdx)},
+		"Tmasqued-Tunnel-Count": []string{strconv.Itoa(tunCount)},
+	}
+	ipconn, rsp, err := connectip.DialWithHeaders(dialCtx, hconn, template, hdrs)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to dial connect-ip connection: %w", err)
 	}
@@ -303,6 +322,42 @@ func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverF
 	}
 
 	return routes, localPrefixes, ipconn, nil
+}
+
+// establishAllTunnels brings up N bonded tunnels to the server. Tunnel 0 is
+// opened first and its assigned inner IP/routes configure the shared TUN
+// device; tunnels 1..N-1 then attach to the same inner IP (the server assigns
+// it idempotently per client cert). All-or-nothing: any failure tears down
+// what was opened so the caller can retry cleanly.
+func establishAllTunnels(ctx context.Context, serverAddr netip.AddrPort, serverHost string, enableKeyLog bool, keyLogPath string, count int) ([]*connectip.Conn, []*water.Interface, error) {
+    conns := make([]*connectip.Conn, 0, count)
+
+    routes, localPrefixes, ipconn0, err := establishMASQUEConn(ctx, serverAddr, serverHost, enableKeyLog, keyLogPath, 0, count)
+    if err != nil {
+        return nil, nil, fmt.Errorf("tunnel 0: %w", err)
+    }
+    conns = append(conns, ipconn0)
+
+    devs, derr := establishTunTapAndRoutes(ctx, routes, localPrefixes)
+    if derr != nil {
+        ipconn0.Close()
+        return nil, nil, fmt.Errorf("TUN/routes setup: %w", derr)
+    }
+
+    for i := 1; i < count; i++ {
+        _, _, ipconn, err := establishMASQUEConn(ctx, serverAddr, serverHost, enableKeyLog, keyLogPath, i, count)
+        if err != nil {
+            for _, c := range conns {
+                c.Close()
+            }
+            for _, d := range devs {
+                d.Close()
+            }
+            return nil, nil, fmt.Errorf("tunnel %d: %w", i, err)
+        }
+        conns = append(conns, ipconn)
+    }
+    return conns, devs, nil
 }
 
 func establishTunTapAndRoutes(ctx context.Context, routes []connectip.IPRoute, localPrefixes []netip.Prefix) ([]*water.Interface, error) {
@@ -361,65 +416,112 @@ func establishTunTapAndRoutes(ctx context.Context, routes []connectip.IPRoute, l
             }
 		}
 	}
-    Bootstrap(&ctx)
+    Bootstrap(ctx)
     return devs, nil
 }
 
-func tunnel(ctx context.Context, connID string, ipconn *connectip.Conn, devs []*water.Interface, isRunningChan chan bool, errChan chan error) {
-	// ONE goroutine reads from MASQUE, round-robins to TUN queues
-	go func() {
-    	i := 0
-        b := make([]byte, 1500)
-    	for {
-        	n, err := ipconn.ReadPacket(b)
-        	if err != nil {
-            	select {
-                	case errChan <- fmt.Errorf("fatal read from MASQUE: %w", err):
-                	default:
-            	}
-            	return
-        	}
-        	if _, err := devs[i%len(devs)].Write(b[:n]); err != nil {
-            	select {
-                	case errChan <- fmt.Errorf("failed to write to TUN queue %d: %w", i%len(devs), err):
-                	default:
-            	}
-        	}
-        	i++
-    	}
-	}()
-	
-	// N goroutines each read from their own TUN queue fd → write to MASQUE
-	for i, dev := range devs {
-    	go func(d *water.Interface, id int) {
-            b := make([]byte, 1500)
-        	for {
-            	n, err := d.Read(b)
-            	if err != nil {
-                	select {
-                    	case errChan <- fmt.Errorf("%s queue#%d fatal read from TUN: %w", connID, id, err):
-                    	default:
-                	}
-                	return
-            	}
-            	icmp, err := ipconn.WritePacket(b[:n])
-            	if err != nil {
-                	select {
-                    	case errChan <- fmt.Errorf("%s queue#%d failed to write to MASQUE: %w", connID, id, err):
-                    	default:
-                	}
-            	}
-            	if len(icmp) > 0 {
-                	if _, err := d.Write(icmp); err != nil {
-                    	select {
-                        	case errChan <- fmt.Errorf("%s queue#%d failed to write ICMP: %w", connID, id, err):
-                        	default:
-                    	}
-                	}
-            	}
-        	}
-    	}(dev, i)
+func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interface, isRunningChan chan bool, errChan chan error) {
+	n := len(conns)
+
+	// Inbound: one reader per tunnel → a TUN queue. Each tunnel's quic-go
+	// connection decrypts on its own goroutine, so this parallelises across cores.
+	for i, c := range conns {
+		go func(c *connectip.Conn, id int) {
+			dev := devs[id%len(devs)]
+			b := make([]byte, 1500)
+			for {
+				m, err := c.ReadPacket(b)
+				if err != nil {
+					select {
+						case errChan <- fmt.Errorf("tunnel#%d fatal read from MASQUE: %w", id, err):
+						default:
+					}
+					return
+				}
+				if _, err := dev.Write(b[:m]); err != nil {
+					select {
+						case errChan <- fmt.Errorf("tunnel#%d failed to write to TUN: %w", id, err):
+						default:
+					}
+				}
+			}
+		}(c, i)
 	}
-    isRunningChan <- true
-    <-ctx.Done()
+
+	// Outbound: one reader per TUN queue. Each packet is pinned to a tunnel by
+	// the symmetric flow hash, so the server's return traffic for that flow
+	// comes back on the same tunnel (must match server flowHashSym exactly).
+	for i, dev := range devs {
+		go func(d *water.Interface, id int) {
+			b := make([]byte, 1500)
+			for {
+				m, err := d.Read(b)
+				if err != nil {
+					select {
+						case errChan <- fmt.Errorf("queue#%d fatal read from TUN: %w", id, err):
+						default:
+					}
+					return
+				}
+				idx := int(flowHashSym(b[:m]) % uint32(n))
+				icmp, err := conns[idx].WritePacket(b[:m])
+				if err != nil {
+					select {
+						case errChan <- fmt.Errorf("queue#%d write to tunnel %d: %w", id, idx, err):
+						default:
+					}
+				}
+				if len(icmp) > 0 {
+					if _, err := d.Write(icmp); err != nil {
+						select {
+							case errChan <- fmt.Errorf("queue#%d failed to write ICMP: %w", id, err):
+							default:
+						}
+					}
+				}
+			}
+		}(dev, i)
+	}
+	isRunningChan <- true
+	<-ctx.Done()
+}
+
+// flowHashSym is the order-independent 5-tuple hash that pins a flow to one
+// bonded tunnel. It MUST stay byte-for-byte identical to the server's
+// flowHashSym (xdp/tunnel.go) so each flow's two directions pick the same
+// tunnel index. See that function for the canonical-input definition.
+func flowHashSym(pkt []byte) uint32 {
+	if len(pkt) < 20 || (pkt[0]>>4) != 4 {
+		return 0
+	}
+	ihl := int(pkt[0]&0x0f) * 4
+	proto := pkt[9]
+	srcIP := pkt[12:16]
+	dstIP := pkt[16:20]
+	var srcPort, dstPort uint16
+	if (proto == 6 || proto == 17) && len(pkt) >= ihl+4 {
+		srcPort = binary.BigEndian.Uint16(pkt[ihl : ihl+2])
+		dstPort = binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])
+	}
+
+	loIP, loPort, hiIP, hiPort := srcIP, srcPort, dstIP, dstPort
+	if c := bytes.Compare(srcIP, dstIP); c > 0 || (c == 0 && srcPort > dstPort) {
+		loIP, loPort, hiIP, hiPort = dstIP, dstPort, srcIP, srcPort
+	}
+
+	const offset32, prime32 = 2166136261, 16777619
+	h := uint32(offset32)
+	upd := func(b byte) { h ^= uint32(b); h *= prime32 }
+	for _, b := range loIP {
+		upd(b)
+	}
+	upd(byte(loPort >> 8))
+	upd(byte(loPort))
+	for _, b := range hiIP {
+		upd(b)
+	}
+	upd(byte(hiPort >> 8))
+	upd(byte(hiPort))
+	upd(proto)
+	return h
 }

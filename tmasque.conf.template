@@ -3,3 +3,6 @@ ENABLE_KEY_LOG=false
 KEY_LOG_PATH=/tmp/tmasque_keylog.txt
 SERVER=FQDN:443
 FWMARK=9484
+ENABLE_PERFORMANCE_MONITOR=false
+# Number of parallel QUIC tunnels to bond for throughput (default 4).
+TUNNEL_COUNT=4

@@ -9,7 +9,7 @@ Vagrant.configure("2") do |config|
       node.vm.provider :libvirt do |libvirt|
         libvirt.uri = "qemu:///system"
         libvirt.default_prefix = "vagrant"
-        libvirt.cpus = 2
+        libvirt.cpus = 4
         libvirt.memory = 2048
         libvirt.cpu_mode = "host-passthrough"
         libvirt.storage_pool_name = "default"
