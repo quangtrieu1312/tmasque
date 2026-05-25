@@ -50,11 +50,9 @@ func Bootstrap(ctx context.Context) {
 
 func RunPostUp(ctx context.Context) {
     logger.LogInfo("Exec post up")
-	enablePerfMon, ok := ctx.Value("ENABLE_PERFORMANCE_MONITOR").(bool)
-	if !ok {
-		enablePerfMon = false
-	}
-	if enablePerfMon {
+	enableStatsStr, _ := ctx.Value("ENABLE_STATISTIC").(string)
+	enableStats, _ := strconv.ParseBool(enableStatsStr)
+	if enableStats {
 		go http.ListenAndServe("localhost:9484", nil)
 	}
 }
