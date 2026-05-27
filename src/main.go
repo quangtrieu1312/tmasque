@@ -421,48 +421,94 @@ func establishTunTapAndRoutes(ctx context.Context, routes []connectip.IPRoute, l
 func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interface, isRunningChan chan bool, errChan chan error) {
 	n := len(conns)
 
+	// Receiver-side per-flow resequencer. Off by default (net-negative in testing);
+	// enable with FORWARD_RESEQ=true in the config.
+	reseqEnabled := false
+	if v, _ := ctx.Value("FORWARD_RESEQ").(string); v != "" {
+		reseqEnabled, _ = strconv.ParseBool(v)
+	}
+
+	// Download pre-reseq reorder counter. Logs every 2s when ENABLE_STATISTIC is on.
+	if v, _ := ctx.Value("ENABLE_STATISTIC").(string); v != "" {
+		if on, _ := strconv.ParseBool(v); on {
+			go func() {
+				t := time.NewTicker(2 * time.Second)
+				defer t.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-t.C:
+						tot := utility.PreReseqTotal.Load()
+						ooo := utility.PreReseqOOO.Load()
+						pct := 0.0
+						if tot > 0 {
+							pct = 100 * float64(ooo) / float64(tot)
+						}
+						logger.LogInfo(fmt.Sprintf("pre-reseq: total=%d ooo=%d (%.1f%%)", tot, ooo, pct))
+					}
+				}
+			}()
+		}
+	}
+
 	// Inbound: one reader per tunnel → a TUN queue. Each tunnel's quic-go
 	// connection decrypts on its own goroutine, so this parallelises across cores.
 	for i, c := range conns {
 		go func(c *connectip.Conn, id int) {
 			dev := devs[id%len(devs)]
 			b := make([]byte, 1500)
-			// Receiver-side per-flow reorder: QUIC datagrams arrive unordered, so
-			// reorder the inner stream by TCP seq before the TUN or TCP collapses cwnd.
-			reseq := utility.NewForwardReseq(128, 5*time.Millisecond)
+			// Measure reorder AS QUIC delivers it, before reseq reorders, to tell
+			// transport reorder apart from reseq-introduced reorder.
+			obs := utility.NewPreReseqObserver()
 			var out [][]byte
 
-			// A genuinely missing segment must not stall the flow forever; ReadPacket
-			// blocks, so drive FlushExpired from a ticker (reseq is mutex-guarded).
+			// Receiver-side per-flow reorder: QUIC datagrams arrive unordered, so
+			// reorder the inner stream by TCP seq before the TUN or TCP collapses cwnd.
+			// Only active when FORWARD_RESEQ=true (off by default).
+			var reseq *utility.ForwardReseq
 			flushStop := make(chan struct{})
-			go func() {
-				t := time.NewTicker(2 * time.Millisecond)
-				defer t.Stop()
-				var fout [][]byte
-				for {
-					select {
-					case <-flushStop:
-						return
-					case now := <-t.C:
-						fout = reseq.FlushExpired(now, fout[:0])
-						for _, p := range fout {
-							dev.Write(p)
+			if reseqEnabled {
+				reseq = utility.NewForwardReseq(128, 5*time.Millisecond)
+				// A genuinely missing segment must not stall the flow forever;
+				// ReadPacket blocks, so drive FlushExpired from a ticker (reseq is
+				// mutex-guarded).
+				go func() {
+					t := time.NewTicker(2 * time.Millisecond)
+					defer t.Stop()
+					var fout [][]byte
+					for {
+						select {
+						case <-flushStop:
+							return
+						case now := <-t.C:
+							fout = reseq.FlushExpired(now, fout[:0])
+							for _, p := range fout {
+								dev.Write(p)
+							}
 						}
 					}
-				}
-			}()
+				}()
+			}
 
 			for {
 				m, err := c.ReadPacket(b)
 				if err != nil {
-					close(flushStop)
+					if reseqEnabled {
+						close(flushStop)
+					}
 					select {
 						case errChan <- fmt.Errorf("tunnel#%d fatal read from MASQUE: %w", id, err):
 						default:
 					}
 					return
 				}
-				out = reseq.Push(b[:m], time.Now(), out[:0])
+				obs.Observe(b[:m])
+				if reseqEnabled {
+					out = reseq.Push(b[:m], time.Now(), out[:0])
+				} else {
+					out = append(out[:0], b[:m])
+				}
 				for _, p := range out {
 					if _, err := dev.Write(p); err != nil {
 						select {
