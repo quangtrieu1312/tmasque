@@ -427,19 +427,48 @@ func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interfac
 		go func(c *connectip.Conn, id int) {
 			dev := devs[id%len(devs)]
 			b := make([]byte, 1500)
+			// Receiver-side per-flow reorder: QUIC datagrams arrive unordered, so
+			// reorder the inner stream by TCP seq before the TUN or TCP collapses cwnd.
+			reseq := utility.NewForwardReseq(128, 5*time.Millisecond)
+			var out [][]byte
+
+			// A genuinely missing segment must not stall the flow forever; ReadPacket
+			// blocks, so drive FlushExpired from a ticker (reseq is mutex-guarded).
+			flushStop := make(chan struct{})
+			go func() {
+				t := time.NewTicker(2 * time.Millisecond)
+				defer t.Stop()
+				var fout [][]byte
+				for {
+					select {
+					case <-flushStop:
+						return
+					case now := <-t.C:
+						fout = reseq.FlushExpired(now, fout[:0])
+						for _, p := range fout {
+							dev.Write(p)
+						}
+					}
+				}
+			}()
+
 			for {
 				m, err := c.ReadPacket(b)
 				if err != nil {
+					close(flushStop)
 					select {
 						case errChan <- fmt.Errorf("tunnel#%d fatal read from MASQUE: %w", id, err):
 						default:
 					}
 					return
 				}
-				if _, err := dev.Write(b[:m]); err != nil {
-					select {
-						case errChan <- fmt.Errorf("tunnel#%d failed to write to TUN: %w", id, err):
-						default:
+				out = reseq.Push(b[:m], time.Now(), out[:0])
+				for _, p := range out {
+					if _, err := dev.Write(p); err != nil {
+						select {
+							case errChan <- fmt.Errorf("tunnel#%d failed to write to TUN: %w", id, err):
+							default:
+						}
 					}
 				}
 			}
