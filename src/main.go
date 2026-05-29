@@ -262,25 +262,38 @@ func main() {
     }
     logger.LogInfo(fmt.Sprintf("Bonding %d parallel tunnels", tunnelCount))
     go func(contxt context.Context) {
-        errorThreshold := 3
-        attempt := 1
+        // Reconnect policy. A VPN client must NOT self-terminate on network trouble — a
+        // merely-lossy/jittery outer leg, or a transient server blip, should drive a
+        // reconnect, never a process exit. The old code incremented a single `attempt`
+        // counter on EVERY establish-failure AND every runtime drop, NEVER reset it, and
+        // exited via "Out of attempts" → cancel() after just 3 cumulative errors over the
+        // whole session — so on any flaky network the client eventually killed itself,
+        // tun0 vanished, and throughput went to a hard 0 (WireGuard, by contrast, retries
+        // forever). Fix: retry indefinitely with capped exponential backoff; reset the
+        // backoff whenever a connection has been stably up, so transient drops recover
+        // instantly and only a genuinely-unreachable server backs off (it never gives up).
+        backoff := time.Second
+        const maxBackoff = 15 * time.Second
+        const stableUptime = 10 * time.Second
         for {
-            if attempt >= errorThreshold {
-                errChan <- fmt.Errorf("Out of attempts")
-            }
-            logger.LogInfo(fmt.Sprintf("Number of retry attempts left = %d", errorThreshold - attempt))
 	        conns, devs, err := establishAllTunnels(ctx, serverAddr, serverHost, enableKeyLog, keyLogPath, tunnelCount)
 	        if err != nil {
-                logger.LogError(fmt.Sprintf("Failed to establish bonded MASQUE tunnels: %v", err))
-                attempt++
+                logger.LogError(fmt.Sprintf("Failed to establish bonded MASQUE tunnels: %v (retry in %v)", err, backoff))
+                select {
+                case <-ctx.Done():
+                    return
+                case <-time.After(backoff):
+                }
+                backoff = min(backoff*2, maxBackoff)
                 continue
 	        }
+            backoff = time.Second // connected — reset backoff
 	        logger.LogDebug(fmt.Sprintf("Created TUN device: %s with %d bonded tunnels", devs[0].Name(), len(conns)))
+            upTime := time.Now()
             eChan := make(chan error, runtime.NumCPU() + tunnelCount + 1)
 			connCtx, connCancel := context.WithCancel(ctx)
             go func() {
                 cerr := <-eChan
-                attempt++
                 logger.LogError(fmt.Sprintf("Tunneling error: %v", cerr))
 				connCancel()
 				for _, c := range conns {
@@ -291,6 +304,19 @@ func main() {
 				}
             }()
             tunnel(connCtx, conns, devs, isRunningChan, eChan)
+            // tunnel() returned ⇒ the connection dropped. If it had been stably up, treat
+            // the drop as transient and reconnect immediately; otherwise back off.
+            if ctx.Err() != nil {
+                return
+            }
+            if time.Since(upTime) < stableUptime {
+                select {
+                case <-ctx.Done():
+                    return
+                case <-time.After(backoff):
+                }
+                backoff = min(backoff*2, maxBackoff)
+            }
         }
     }(ctx)
     <-ctx.Done()
@@ -510,9 +536,22 @@ func establishTunTapAndRoutes(ctx context.Context, routes []connectip.IPRoute, l
     	devs[i] = dev
 	}
 
+    // Tunnel link MTU, read from config (TUNNEL_MTU) like the server does; default
+    // 1416 to MATCH the server (the old hardcoded 1252 was below both the server's
+    // 1416 and connect-ip's minMTU=1280, needlessly shrinking the client's egress MSS).
+    // Per draft-ietf-masque-connect-ip the CONNECT-IP encap overhead is ≤51B; with
+    // IPv4+UDP (28B) that leaves up to 1421 on a 1500 path, so 1416 is safe (verified:
+    // 6/6 consistent uploads to a forwarded external target). Ops can lower it via the
+    // config for client paths with a smaller real MTU. Floor 576 (IPv4 min datagram).
+    mtu := 1416
+    if v := ctx.Value("TUNNEL_MTU"); v != nil {
+        if m, perr := strconv.ParseUint(v.(string), 10, 64); perr == nil && m >= 576 {
+            mtu = int(m)
+        }
+    }
     // link setup only needs to happen once, on devs[0]
     link, err := netlink.LinkByName(devName)
-    netlink.LinkSetMTU(link, 1252)
+    netlink.LinkSetMTU(link, mtu)
     if err != nil {
         return nil, fmt.Errorf("failed to get TUN interface: %w", err)
     }
