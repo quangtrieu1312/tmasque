@@ -7,3 +7,6 @@
 [submodule "lib/quic-go"]
 	path = lib/quic-go
 	url = git@github.com:quangtrieu1312/quic-go
+[submodule "lib/water"]
+	path = lib/water
+	url = git@github.com:quangtrieu1312/water

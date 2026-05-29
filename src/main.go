@@ -38,10 +38,111 @@ import (
 	"github.com/quangtrieu1312/tmasque/utility"
 )
 
+// delAllTable9000Rules removes EVERY `ip rule` entry pointing at table 9000.
+// A single `ip rule del` removes only ONE match, but entries accumulate: each
+// connection attempt calls Bootstrap (which adds one) and the retry loop can run
+// it several times, plus an unclean prior exit can leave stale entries. So we
+// loop until `ip rule del` fails (no more matching rule). Best-effort — a failure
+// just means there's nothing left to delete, never fatal.
+func delAllTable9000Rules() {
+    for i := 0; i < 64; i++ {
+        if err := exec.Command("/sbin/ip", "rule", "del", "table", "9000").Run(); err != nil {
+            break
+        }
+    }
+}
+
+// enforceBBR sets the host's default TCP congestion control to BBR when available.
+// The inner TCP flows the tunnel carries belong to the host's apps, not to tmasque,
+// so the only lever on their CC is the system default — set it here at startup.
+// BBR is rate/RTT-based and tolerates the small non-congestive loss/reorder a
+// userspace tunnel injects, which collapses loss-based CUBIC (P1-up 38→432 measured;
+// the path-level effect helps any tunnel, but it's the right CC for tunnel transport
+// and only affects flows ORIGINATING on this host — i.e. the upload sender). Best
+// effort and non-fatal: missing module / restricted /proc just logs and continues.
+// Override with TCP_CC (e.g. TCP_CC=cubic to disable, TCP_CC=off to skip entirely).
+func enforceBBR(ctx context.Context) {
+    cc := "bbr"
+    if v, _ := ctx.Value("TCP_CC").(string); v != "" {
+        if strings.EqualFold(v, "off") || strings.EqualFold(v, "none") {
+            return
+        }
+        cc = strings.ToLower(v)
+    }
+    // Load the module if it isn't built in (ignore errors — may be builtin or denied).
+    _ = exec.Command("/sbin/modprobe", "tcp_"+cc).Run()
+    avail, err := os.ReadFile("/proc/sys/net/ipv4/tcp_available_congestion_control")
+    if err != nil {
+        logger.LogInfo(fmt.Sprintf("TCP CC: cannot read available algorithms (%v); leaving system default", err))
+        return
+    }
+    if !containsField(string(avail), cc) {
+        logger.LogInfo(fmt.Sprintf("TCP CC: %q not available (have: %s); leaving system default", cc, strings.TrimSpace(string(avail))))
+        return
+    }
+    if err := os.WriteFile("/proc/sys/net/ipv4/tcp_congestion_control", []byte(cc), 0644); err != nil {
+        logger.LogInfo(fmt.Sprintf("TCP CC: failed to set %q (%v); leaving system default", cc, err))
+        return
+    }
+    logger.LogInfo(fmt.Sprintf("TCP CC: host default set to %q for tunnel-tolerant single-stream throughput", cc))
+}
+
+// containsField reports whether space-separated list s contains the exact token tok.
+func containsField(s, tok string) bool {
+    for _, f := range strings.Fields(s) {
+        if f == tok {
+            return true
+        }
+    }
+    return false
+}
+
+// udpBufTarget is the UDP socket buffer ceiling we want for the QUIC transport.
+// quic-go requests ~7 MB via SO_RCVBUF/SO_SNDBUF but the kernel silently caps the
+// request at net.core.{r,w}mem_max, whose stock default is ~208 KB. A 208 KB rcvbuf
+// overflows on bursts → the kernel drops UDP packets → loss that is survivable for
+// 100 multiplexed flows but FATAL to a single stream (its cwnd collapses). Raising
+// the ceiling lets quic-go's buffer request actually take effect. 7.5 MB.
+const udpBufTarget = 7864320
+
+// raiseSysctl raises a /proc/sys value to target if it is currently lower. Raise
+// only (never lowers a host that's already tuned higher) and best-effort: a missing
+// path or a read-only /proc (restricted container) just logs and continues.
+func raiseSysctl(key string, target int) {
+    path := "/proc/sys/" + strings.ReplaceAll(key, ".", "/")
+    cur := 0
+    if b, err := os.ReadFile(path); err == nil {
+        cur, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+    }
+    if cur >= target {
+        return
+    }
+    if err := os.WriteFile(path, []byte(strconv.Itoa(target)), 0644); err != nil {
+        logger.LogInfo(fmt.Sprintf("sysctl %s: could not raise to %d (%v); leaving %d", key, target, err, cur))
+        return
+    }
+    logger.LogInfo(fmt.Sprintf("sysctl %s: %d -> %d (UDP buffer for QUIC transport)", key, cur, target))
+}
+
+// tuneUDPBuffers raises the UDP socket buffer ceilings so quic-go's large-buffer
+// request isn't silently clamped to the stock ~208 KB (see udpBufTarget). Only the
+// _max ceilings are touched — quic-go sets SO_RCVBUF/SO_SNDBUF explicitly, so the
+// per-socket defaults need not change (avoids bloating every socket on the host).
+func tuneUDPBuffers() {
+    raiseSysctl("net.core.rmem_max", udpBufTarget)
+    raiseSysctl("net.core.wmem_max", udpBufTarget)
+}
+
 func Bootstrap(ctx context.Context) {
     logger.LogInfo("Exec bootstrap")
+    // Optimise the host stack for carrying flows over a userspace QUIC tunnel.
+    enforceBBR(ctx)
+    tuneUDPBuffers()
+    // Clear any stale/duplicate table-9000 rules first so repeated attempts or a
+    // prior unclean exit can't accumulate them.
+    delAllTable9000Rules()
     cmd := exec.Command("/sbin/ip", "rule", "add", "not", "fwmark", ctx.Value("FWMARK").(string), "table", "9000")
-    logger.LogInfo(fmt.Sprintf("Running command: /sbin/ip"))
+    logger.LogInfo("Running command: /sbin/ip rule add not fwmark <FWMARK> table 9000")
     _, err := cmd.Output()
     if err != nil {
         logger.LogFatal(fmt.Sprintf("Error running pre up command: %v", err))
@@ -59,17 +160,14 @@ func RunPostUp(ctx context.Context) {
 
 func GracefullyShutdown() {
     logger.LogInfo("Exec post down")
-    cmd := exec.Command("/bin/bash", "-c", "ip rule del table 9000", "||", "/bin/true")
-    logger.LogInfo(fmt.Sprintf("Deleting ip rule entry for table 9000"))
-    _, err := cmd.Output()
-    if err != nil {
-        logger.LogFatal(fmt.Sprintf("Cannot gracefully shutdown: %v", err))
-    }
-    cmd = exec.Command("/bin/bash", "-c", "ip route flush table 9000", "||", "/bin/true")
-    logger.LogInfo(fmt.Sprintf("Flushing routing table 9000"))
-	_, err = cmd.Output()
-    if err != nil {
-        logger.LogFatal(fmt.Sprintf("Cannot gracefully shutdown: %v", err))
+    // Delete ALL table-9000 rules (loop), not just one — and never fatal, since
+    // shutdown can run twice (signal handler + run loop) and the second pass /
+    // an already-clean state must not abort us before the table flush.
+    logger.LogInfo("Deleting all ip rule entries for table 9000")
+    delAllTable9000Rules()
+    logger.LogInfo("Flushing routing table 9000")
+    if err := exec.Command("/sbin/ip", "route", "flush", "table", "9000").Run(); err != nil {
+        logger.LogInfo(fmt.Sprintf("table 9000 flush: %v (ok if already empty)", err))
     }
 }
 
@@ -278,7 +376,8 @@ func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverF
 		&quic.Config{
 			EnableDatagrams:   true,
 			InitialPacketSize: 1400,
-            KeepAlivePeriod: 15*time.Second,
+            MaxIdleTimeout:  30 * time.Second,
+            KeepAlivePeriod: 10 * time.Second,
 			InitialStreamReceiveWindow:     10 * 1024 * 1024,  // 10 MB
     		MaxStreamReceiveWindow:         10 * 1024 * 1024,  // 10 MB
     		InitialConnectionReceiveWindow: 15 * 1024 * 1024,  // 15 MB
@@ -359,7 +458,28 @@ func establishAllTunnels(ctx context.Context, serverAddr netip.AddrPort, serverH
 }
 
 func establishTunTapAndRoutes(ctx context.Context, routes []connectip.IPRoute, localPrefixes []netip.Prefix) ([]*water.Interface, error) {
+    // Number of MultiQueue TUN fds / reader goroutines. Default = NumCPU, but the
+    // kernel's per-packet queue selection lets a single inner flow's packets land
+    // on different queues, and the reader goroutines then race to WritePacket the
+    // same QUIC connection — reordering that flow. Inner TCP punishes reorder
+    // (spurious fast-retransmit → cwnd collapse), wrecking single-stream
+    // throughput. Set TUN_QUEUES=1 for strict per-flow ordering (mirrors the
+    // server's TUN_QUEUES=1 fix). Aggregate (many flows) has headroom to spare.
     numQueues := runtime.NumCPU()
+    if v := ctx.Value("TUN_QUEUES"); v != nil {
+        if n, perr := strconv.Atoi(v.(string)); perr == nil && n > 0 {
+            numQueues = n
+        }
+    }
+    // TUN_GSO=true enables IFF_VNET_HDR + TSO so the kernel hands coalesced
+    // GSO super-frames per read; water splits them into MTU packets. Cuts the
+    // per-packet read-syscall rate and lets a single flow's packets burst
+    // through the encap→datagram→send pipeline together (amortizing per-packet
+    // goroutine-handoff latency, the WireGuard-go technique).
+    gso := false
+    if v := ctx.Value("TUN_GSO"); v != nil {
+        gso = v.(string) == "true"
+    }
     devs := make([]*water.Interface, numQueues)
 	// First device — let OS assign name
 	var err error
@@ -367,6 +487,7 @@ func establishTunTapAndRoutes(ctx context.Context, routes []connectip.IPRoute, l
     	DeviceType: water.TUN,
     	PlatformSpecificParams: water.PlatformSpecificParams{
         	MultiQueue: true,
+        	GSO:        gso,
     	},
 	})
 	if err != nil {
@@ -380,6 +501,7 @@ func establishTunTapAndRoutes(ctx context.Context, routes []connectip.IPRoute, l
         	PlatformSpecificParams: water.PlatformSpecificParams{
             	Name:       devName, // same device, new fd
             	MultiQueue: true,
+            	GSO:        gso,
         	},
     	})
     	if err != nil {
@@ -445,7 +567,15 @@ func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interfac
 						if tot > 0 {
 							pct = 100 * float64(ooo) / float64(tot)
 						}
-						logger.LogInfo(fmt.Sprintf("pre-reseq: total=%d ooo=%d (%.1f%%)", tot, ooo, pct))
+						gTot := utility.PreSendTotal.Load()
+						gGen := utility.PreSendGenuine.Load()
+						gRetr := utility.PreSendRetr.Load()
+						gPct, rPct := 0.0, 0.0
+						if gTot > 0 {
+							gPct = 100 * float64(gGen) / float64(gTot)
+							rPct = 100 * float64(gRetr) / float64(gTot)
+						}
+						logger.LogInfo(fmt.Sprintf("pre-reseq: total=%d ooo=%d (%.1f%%) | genuine: %d/%d (%.2f%%) retr: %d (%.2f%%)", tot, ooo, pct, gGen, gTot, gPct, gRetr, rPct))
 					}
 				}
 			}()
@@ -454,6 +584,11 @@ func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interfac
 
 	// Inbound: one reader per tunnel → a TUN queue. Each tunnel's quic-go
 	// connection decrypts on its own goroutine, so this parallelises across cores.
+	// NOTE: with TUNNEL_COUNT=1 this single goroutine's ReadPacket (QUIC decode)
+	// rate caps P100-dn at ~430 Mbit even though the server is idle — fanning the
+	// tun-Write syscalls out to parallel writers did NOT help (decode, not write,
+	// is the cap; verified TM_RXFANOUT). Lifting it needs faster single-conn decode
+	// or multi-conn (TUNNEL_COUNT>1 regressed — TC4). Left simple/single-writer.
 	for i, c := range conns {
 		go func(c *connectip.Conn, id int) {
 			dev := devs[id%len(devs)]
@@ -461,42 +596,26 @@ func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interfac
 			// Measure reorder AS QUIC delivers it, before reseq reorders, to tell
 			// transport reorder apart from reseq-introduced reorder.
 			obs := utility.NewPreReseqObserver()
+			genObs := utility.NewPreSendGenuineObserver()
 			var out [][]byte
 
-			// Receiver-side per-flow reorder: QUIC datagrams arrive unordered, so
-			// reorder the inner stream by TCP seq before the TUN or TCP collapses cwnd.
-			// Only active when FORWARD_RESEQ=true (off by default).
+			// Receiver-side per-flow reorder (FORWARD_RESEQ, off by default). The
+			// OCI->client leg + quic-go RX inject ~3% genuine reorder (server packer
+			// 0.10% vs client pre-reseq ~3.4% at P1-dn). SINGLE-WRITER: Push (reorder)
+			// + FlushExpired (idle/tail drain) both run in THIS goroutine, the only
+			// dev writer (the old version flushed from a 2nd goroutine that raced
+			// dev.Write and re-introduced reorder — net-negative). For an active flow
+			// the gap-skip is driven by Push's window-full path; FlushExpired drains
+			// only idle/tail flows. (Resequencing alone does NOT recover single-stream
+			// throughput — the collapse is jitter/loss, not reorder; reseq kept off.)
 			var reseq *utility.ForwardReseq
-			flushStop := make(chan struct{})
 			if reseqEnabled {
 				reseq = utility.NewForwardReseq(128, 5*time.Millisecond)
-				// A genuinely missing segment must not stall the flow forever;
-				// ReadPacket blocks, so drive FlushExpired from a ticker (reseq is
-				// mutex-guarded).
-				go func() {
-					t := time.NewTicker(2 * time.Millisecond)
-					defer t.Stop()
-					var fout [][]byte
-					for {
-						select {
-						case <-flushStop:
-							return
-						case now := <-t.C:
-							fout = reseq.FlushExpired(now, fout[:0])
-							for _, p := range fout {
-								dev.Write(p)
-							}
-						}
-					}
-				}()
 			}
 
 			for {
 				m, err := c.ReadPacket(b)
 				if err != nil {
-					if reseqEnabled {
-						close(flushStop)
-					}
 					select {
 						case errChan <- fmt.Errorf("tunnel#%d fatal read from MASQUE: %w", id, err):
 						default:
@@ -504,8 +623,11 @@ func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interfac
 					return
 				}
 				obs.Observe(b[:m])
+				genObs.Observe(b[:m])
 				if reseqEnabled {
-					out = reseq.Push(b[:m], time.Now(), out[:0])
+					now := time.Now()
+					out = reseq.Push(b[:m], now, out[:0])
+					out = reseq.FlushExpired(now, out)
 				} else {
 					out = append(out[:0], b[:m])
 				}
