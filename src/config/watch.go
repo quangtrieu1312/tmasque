@@ -41,7 +41,7 @@ func Watch(ctx context.Context) {
             unix.Close(fd)
         }()
 
-        const mask = unix.IN_CLOSE_WRITE | unix.IN_MODIFY | unix.IN_IGNORED | unix.IN_MOVE_SELF | unix.IN_DELETE_SELF
+        const mask = unix.IN_CLOSE_WRITE | unix.IN_IGNORED | unix.IN_MOVE_SELF | unix.IN_DELETE_SELF
         addWatch := func() {
             if _, err := unix.InotifyAddWatch(fd, constants.CONF_PATH, mask); err != nil {
                 if logger.ShouldLog(logger.ERROR) {
@@ -60,7 +60,7 @@ func Watch(ctx context.Context) {
             changed, reArm := false, false
             for off := 0; off+unix.SizeofInotifyEvent <= n; {
                 ev := (*unix.InotifyEvent)(unsafe.Pointer(&buf[off]))
-                if ev.Mask&(unix.IN_CLOSE_WRITE|unix.IN_MODIFY) != 0 {
+                if ev.Mask&unix.IN_CLOSE_WRITE != 0 {
                     changed = true
                 }
                 if ev.Mask&(unix.IN_IGNORED|unix.IN_MOVE_SELF|unix.IN_DELETE_SELF) != 0 {

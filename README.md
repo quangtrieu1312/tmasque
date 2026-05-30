@@ -55,6 +55,11 @@ prefixes is steered into the TUN.
 - **MTU.** The TUN MTU is sized to the QUIC datagram payload budget so inner packets never
   exceed it (an over-large MTU silently drops datagrams).
 - **GSO/GRO-capable TUN.** Uses a `water` fork with `IFF_VNET_HDR` + offload split (gated).
+- **Config & hot-reload.** Keys live in `tmasque.conf`. `LOG_LEVEL` and `ENABLE_STATISTIC`
+  are hot-reloaded on save (inotify); everything else needs a restart. QUIC TLS key logging
+  is off unless `KEY_LOG_PATH` is set (the file and its directory are created on connect).
+  `ENABLE_STATISTIC` emits `[STATISTIC]` diagnostics and is an independent on/off channel,
+  not a verbosity level.
 
 ---
 

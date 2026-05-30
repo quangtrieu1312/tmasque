@@ -1,9 +1,15 @@
+# LOG_LEVEL and ENABLE_STATISTIC are hot-reloaded when this file is saved (no restart
+# needed). Every other key (SERVER, FWMARK, KEY_LOG_PATH, TUNNEL_COUNT, …) is read once
+# at startup and needs a restart to change. Comments must be on their own line — an
+# inline "KEY=val # note" makes "# note" part of the value.
 LOG_LEVEL=info
 # Set KEY_LOG_PATH to a path to enable QUIC TLS key logging (for Wireshark); the
 # file is auto-created on connect. Leave it unset to disable key logging (default).
 # KEY_LOG_PATH=/tmp/tmasque_keylog.txt
 SERVER=FQDN:443
 FWMARK=9484
+# ENABLE_STATISTIC=true turns on the "[STATISTIC]" pre-reseq diagnostics, the per-packet
+# observers, and the pprof endpoint on :9484. Off by default.
 ENABLE_STATISTIC=false
 # Number of parallel QUIC tunnels to bond for throughput (default 4).
 TUNNEL_COUNT=4
