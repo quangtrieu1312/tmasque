@@ -44,9 +44,12 @@ prefixes is steered into the TUN.
 - **Outer transport: QUIC with BBR.** The tunnel's QUIC connection uses BBR congestion
   control; the *inner* traffic keeps its own end-to-end congestion control. Inner IP rides
   unreliable **QUIC DATAGRAMs** (no head-of-line blocking, no tunnel-level retransmission).
-- **Reconnect robustness.** The client retries forever with capped backoff and resets the
-  backoff once a connection is stable, so a server restart or transient network loss
-  recovers without manual intervention.
+- **Reconnect & fail-open exit.** The client retries with capped exponential backoff,
+  resetting its budget once a connection has been stable, so transient loss recovers
+  without intervention. After `RECONNECT_ATTEMPTS` consecutive failures (default 3) it
+  **exits cleanly** rather than wedging: shutdown removes its `fwmark` policy rule and
+  flushes the routing table, so an unreachable server leaves the host on normal routing
+  instead of blackholing it (the policy table may carry a full `0.0.0.0/0` default).
 - **Inner-TCP buffer tuning.** The tunnel adds RTT (larger inner BDP); the client raises
   `tcp_wmem`/`tcp_rmem` at bootstrap so a single inner upload isn't send-buffer limited.
 - **MTU.** The TUN MTU is sized to the QUIC datagram payload budget so inner packets never

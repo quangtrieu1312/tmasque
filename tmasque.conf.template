@@ -6,3 +6,8 @@ FWMARK=9484
 ENABLE_STATISTIC=false
 # Number of parallel QUIC tunnels to bond for throughput (default 4).
 TUNNEL_COUNT=4
+# Consecutive (re)connect attempts before the client gives up and exits (default 3
+# when unset). On exit the client removes its `not fwmark table 9000` policy rule and
+# flushes table 9000, restoring the host's normal routing instead of blackholing it.
+# The budget resets after a connection has been stably up, so transient drops recover.
+RECONNECT_ATTEMPTS=3

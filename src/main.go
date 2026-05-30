@@ -315,23 +315,46 @@ func main() {
     }
     logger.LogInfo(fmt.Sprintf("Bonding %d parallel tunnels", tunnelCount))
     go func(contxt context.Context) {
-        // Reconnect policy. A VPN client must NOT self-terminate on network trouble — a
-        // merely-lossy/jittery outer leg, or a transient server blip, should drive a
-        // reconnect, never a process exit. The old code incremented a single `attempt`
-        // counter on EVERY establish-failure AND every runtime drop, NEVER reset it, and
-        // exited via "Out of attempts" → cancel() after just 3 cumulative errors over the
-        // whole session — so on any flaky network the client eventually killed itself,
-        // tun0 vanished, and throughput went to a hard 0 (WireGuard, by contrast, retries
-        // forever). Fix: retry indefinitely with capped exponential backoff; reset the
-        // backoff whenever a connection has been stably up, so transient drops recover
-        // instantly and only a genuinely-unreachable server backs off (it never gives up).
+        // Reconnect policy: bounded retries, then exit cleanly.
+        //
+        // A transient blip (lossy/jittery outer leg, a brief server hiccup) should drive a
+        // reconnect, but a genuinely-unreachable server must NOT keep us alive forever.
+        // Staying up holds the `not fwmark table 9000` policy rule in place; since table
+        // 9000 may carry a full 0.0.0.0/0 default (the operator's choice), a wedged client
+        // would blackhole the host's own internet. Exiting instead runs GracefullyShutdown(),
+        // which deletes the rule and flushes table 9000, so the host deterministically falls
+        // back to normal routing. A server restart is the admin's call (they usually run a
+        // client too), so giving up after a bounded budget is acceptable.
+        //
+        // The budget RESETS once a connection has been stably up, so a long healthy session
+        // that hiccups isn't killed by accumulated drops (the bug in the original
+        // single-never-reset counter); only consecutive failures with no stable connection
+        // between them exhaust it. Backoff is capped-exponential.
+        // Tune via RECONNECT_ATTEMPTS (default 3 when unset).
+        maxAttempts := 3
+        if v := contxt.Value("RECONNECT_ATTEMPTS"); v != nil {
+            if n, perr := strconv.Atoi(v.(string)); perr == nil && n > 0 {
+                maxAttempts = n
+            }
+        }
         backoff := time.Second
         const maxBackoff = 15 * time.Second
         const stableUptime = 10 * time.Second
+        attempts := 0
+        giveUp := func(reason string) {
+            logger.LogError(fmt.Sprintf("Out of reconnect attempts (%d/%d): %s; shutting down", attempts, maxAttempts, reason))
+            GracefullyShutdown()
+            cancel()
+        }
         for {
 	        conns, devs, err := establishAllTunnels(ctx, serverAddr, serverHost, enableKeyLog, keyLogPath, tunnelCount)
 	        if err != nil {
-                logger.LogError(fmt.Sprintf("Failed to establish bonded MASQUE tunnels: %v (retry in %v)", err, backoff))
+                attempts++
+                if attempts >= maxAttempts {
+                    giveUp(fmt.Sprintf("failed to establish bonded MASQUE tunnels: %v", err))
+                    return
+                }
+                logger.LogError(fmt.Sprintf("Failed to establish bonded MASQUE tunnels: %v (attempt %d/%d, retry in %v)", err, attempts, maxAttempts, backoff))
                 select {
                 case <-ctx.Done():
                     return
@@ -357,19 +380,29 @@ func main() {
 				}
             }()
             tunnel(connCtx, conns, devs, isRunningChan, eChan)
-            // tunnel() returned ⇒ the connection dropped. If it had been stably up, treat
-            // the drop as transient and reconnect immediately; otherwise back off.
+            // tunnel() returned ⇒ the connection dropped.
             if ctx.Err() != nil {
                 return
             }
-            if time.Since(upTime) < stableUptime {
-                select {
-                case <-ctx.Done():
-                    return
-                case <-time.After(backoff):
-                }
-                backoff = min(backoff*2, maxBackoff)
+            if time.Since(upTime) >= stableUptime {
+                // Stably-up session dropped: a fresh outage episode — reset the budget and
+                // reconnect immediately.
+                attempts = 0
+                backoff = time.Second
+                continue
             }
+            // Never stabilized: count it against the budget and back off.
+            attempts++
+            if attempts >= maxAttempts {
+                giveUp("connection kept dropping before stabilizing")
+                return
+            }
+            select {
+            case <-ctx.Done():
+                return
+            case <-time.After(backoff):
+            }
+            backoff = min(backoff*2, maxBackoff)
         }
     }(ctx)
     <-ctx.Done()
