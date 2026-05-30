@@ -487,7 +487,10 @@ func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverF
         if err != nil {
 		    if logger.ShouldLog(logger.ERROR) { logger.Error(fmt.Sprintf("failed to create key log file %q: %v", keyLogPath, err)) }
         } else {
-            defer keyLog.Close()
+            // Only set the writer on success (assigning a nil *os.File to the io.Writer
+            // field would make QUIC call Write on nil → the errors seen with keylog off).
+            // Don't defer-close: QUIC writes key material during the handshake AND on key
+            // updates, so closing at function return would break later writes.
             tlsConf.KeyLogWriter = keyLog
         }
     }
