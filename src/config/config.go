@@ -20,30 +20,19 @@ func Load(ctx *context.Context) {
     defer file.Close()
     scanner := bufio.NewScanner(file)
     for scanner.Scan() {
-        data := strings.Trim(scanner.Text(), " \t")
-        if len(data) == 0 {
+        line := strings.TrimSpace(scanner.Text())
+        if len(line) == 0 || strings.HasPrefix(line, "#") {
             continue
         }
-        isKey := true
-        k := ""
-        v := ""
-        for pos, char := range data {
-            if (pos == 0 && char == '#') {
-                continue
-            }
-            if (isKey && char == '=') {
-                isKey = false
-                continue
-            }
-            if (isKey) {
-                k+=string(char)
-            } else {
-                v+=string(char)
-            }
+        parts := strings.SplitN(line, "=", 2)
+        if len(parts) != 2 {
+            continue
         }
-        if (k == "") {
-            log.Fatalf("[FATAL] Invalid config format")
+        key := strings.TrimSpace(parts[0])
+        value := strings.TrimSpace(parts[1])
+        if key == "" {
+            continue
         }
-        *ctx = context.WithValue(*ctx, k, v)
+        *ctx = context.WithValue(*ctx, key, value)
     }
 }
