@@ -284,13 +284,9 @@ func main() {
     ctx = context.WithValue(ctx, "SERVER_IP", serverIp.String())
     if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("Connecting to %v", serverIp)) }
 	serverAddr := netip.AddrPortFrom(serverIp, uint16(serverPort))
-    // QUIC key logging is opt-in. If the config keys are absent the feature stays
-    // disabled — and we read ctx via the comma-ok form so a missing key can't panic
-    // a type assertion (which is what made the client unable to start without them).
-    enableKeyLog := false
-    if v, ok := ctx.Value("ENABLE_KEY_LOG").(string); ok {
-        enableKeyLog, _ = strconv.ParseBool(v)
-    }
+    // QUIC key logging is opt-in via KEY_LOG_PATH: set it to a path to enable (the
+    // file is created when a tunnel dials), leave it unset/empty to disable. The
+    // comma-ok read means a missing config key can't panic a type assertion.
     keyLogPath := ""
     if v, ok := ctx.Value("KEY_LOG_PATH").(string); ok {
         keyLogPath = v
@@ -357,7 +353,7 @@ func main() {
             cancel()
         }
         for {
-	        conns, devs, err := establishAllTunnels(ctx, serverAddr, serverHost, enableKeyLog, keyLogPath, tunnelCount)
+	        conns, devs, err := establishAllTunnels(ctx, serverAddr, serverHost, keyLogPath, tunnelCount)
 	        if err != nil {
                 attempts++
                 if attempts >= maxAttempts {
@@ -425,7 +421,7 @@ func healthCheck(ctx context.Context) error {
     return nil
 }
 
-func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverFQDN string, enableKeyLog bool, keyLogPath string, tunIdx, tunCount int) ([]connectip.IPRoute, []netip.Prefix, *connectip.Conn, error) {
+func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverFQDN string, keyLogPath string, tunIdx, tunCount int) ([]connectip.IPRoute, []netip.Prefix, *connectip.Conn, error) {
     fwmark, err := strconv.ParseInt(ctx.Value("FWMARK").(string), 10, 32)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to parse FWMARK config to number: %w", err)
@@ -475,10 +471,7 @@ func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverF
         RootCAs:            certPool,
 		Certificates:       []tls.Certificate{cert},
     }
-    if enableKeyLog {
-        if keyLogPath == "" {
-            keyLogPath = "keys.txt"
-        }
+    if keyLogPath != "" {
         // Create the parent dir + file before QUIC writes to it.
         if dir := filepath.Dir(keyLogPath); dir != "." && dir != "" {
             os.MkdirAll(dir, 0755)
@@ -558,10 +551,10 @@ func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverF
 // device; tunnels 1..N-1 then attach to the same inner IP (the server assigns
 // it idempotently per client cert). All-or-nothing: any failure tears down
 // what was opened so the caller can retry cleanly.
-func establishAllTunnels(ctx context.Context, serverAddr netip.AddrPort, serverHost string, enableKeyLog bool, keyLogPath string, count int) ([]*connectip.Conn, []*water.Interface, error) {
+func establishAllTunnels(ctx context.Context, serverAddr netip.AddrPort, serverHost string, keyLogPath string, count int) ([]*connectip.Conn, []*water.Interface, error) {
     conns := make([]*connectip.Conn, 0, count)
 
-    routes, localPrefixes, ipconn0, err := establishMASQUEConn(ctx, serverAddr, serverHost, enableKeyLog, keyLogPath, 0, count)
+    routes, localPrefixes, ipconn0, err := establishMASQUEConn(ctx, serverAddr, serverHost, keyLogPath, 0, count)
     if err != nil {
         return nil, nil, fmt.Errorf("tunnel 0: %w", err)
     }
@@ -574,7 +567,7 @@ func establishAllTunnels(ctx context.Context, serverAddr netip.AddrPort, serverH
     }
 
     for i := 1; i < count; i++ {
-        _, _, ipconn, err := establishMASQUEConn(ctx, serverAddr, serverHost, enableKeyLog, keyLogPath, i, count)
+        _, _, ipconn, err := establishMASQUEConn(ctx, serverAddr, serverHost, keyLogPath, i, count)
         if err != nil {
             for _, c := range conns {
                 c.Close()
