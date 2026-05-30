@@ -256,6 +256,11 @@ func main() {
         log.SetOutput(wrt)
     }
     defer f.Close()
+    // Enable the STATISTIC log channel + per-packet observers when configured.
+    if v, _ := ctx.Value("ENABLE_STATISTIC").(string); v != "" {
+        on, _ := strconv.ParseBool(v)
+        logger.SetStatistic(on)
+    }
     serverInfo := ctx.Value("SERVER").(string)
     serverHost := serverInfo
     serverPort := 443
@@ -715,7 +720,7 @@ func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interfac
 							gPct = 100 * float64(gGen) / float64(gTot)
 							rPct = 100 * float64(gRetr) / float64(gTot)
 						}
-						if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("pre-reseq: total=%d ooo=%d (%.1f%%) | genuine: %d/%d (%.2f%%) retr: %d (%.2f%%)", tot, ooo, pct, gGen, gTot, gPct, gRetr, rPct)) }
+						if logger.ShouldLog(logger.STATISTIC) { logger.Statistic(fmt.Sprintf("pre-reseq: total=%d ooo=%d (%.1f%%) | genuine: %d/%d (%.2f%%) retr: %d (%.2f%%)", tot, ooo, pct, gGen, gTot, gPct, gRetr, rPct)) }
 					}
 				}
 			}()
@@ -762,8 +767,10 @@ func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interfac
 					}
 					return
 				}
-				obs.Observe(b[:m])
-				genObs.Observe(b[:m])
+				if logger.ShouldLog(logger.STATISTIC) {
+					obs.Observe(b[:m])
+					genObs.Observe(b[:m])
+				}
 				if reseqEnabled {
 					now := time.Now()
 					out = reseq.Push(b[:m], now, out[:0])

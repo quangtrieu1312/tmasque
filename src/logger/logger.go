@@ -18,6 +18,12 @@ const (
     TRACE
 )
 
+// STATISTIC is a special on/off channel (set from ENABLE_STATISTIC), independent of
+// the FATAL..TRACE verbosity ladder — so periodic counters/diagnostics can be turned
+// on without raising the log level. ShouldLog(STATISTIC) returns its toggle and
+// Statistic() emits "[STATISTIC]: ...".
+const STATISTIC LogLevel = 100
+
 var levelName = map[LogLevel]string {
     FATAL: "FATAL",
     ERROR: "ERROR",
@@ -25,6 +31,7 @@ var levelName = map[LogLevel]string {
     INFO: "INFO",
     DEBUG: "DEBUG",
     TRACE: "TRACE",
+    STATISTIC: "STATISTIC",
 }
 
 func ConvertStringToLogLevel(levelName string) LogLevel {
@@ -52,6 +59,7 @@ var lock = &sync.Mutex{}
 type logger struct {
     level LogLevel
     logPath string
+    statistic bool
 }
 
 var loggerInstance *logger
@@ -61,7 +69,7 @@ func GetLoggerInstance() *logger {
         lock.Lock()
         defer lock.Unlock()
         if loggerInstance == nil {
-            loggerInstance = &logger{INFO, "masque.log"}
+            loggerInstance = &logger{level: INFO, logPath: "masque.log"}
         }
     }
     return loggerInstance
@@ -102,7 +110,22 @@ func (level LogLevel) string() string {
 // the formatting work is skipped entirely when the message would be dropped —
 // important on memory-constrained / diskless clients. Matches the server logger.
 func ShouldLog(level LogLevel) bool {
+    if level == STATISTIC {
+        return GetLoggerInstance().statistic
+    }
     return GetLogLevel() >= level
+}
+
+// SetStatistic toggles the STATISTIC channel on/off (set this from ENABLE_STATISTIC).
+func SetStatistic(on bool) {
+    GetLoggerInstance().statistic = on
+}
+
+// Statistic emits a "[STATISTIC]: ..." line when the STATISTIC channel is on.
+func Statistic(msg string) {
+    if GetLoggerInstance().statistic {
+        log.Printf("[%v]: %v", STATISTIC.string(), msg)
+    }
 }
 
 func Fatal(msg string) {
