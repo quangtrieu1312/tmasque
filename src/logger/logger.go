@@ -97,38 +97,46 @@ func (level LogLevel) string() string {
     return levelName[level]
 }
 
-func LogFatal(msg string) {
+// ShouldLog reports whether a message at the given level would be emitted at the
+// current log level. Call it before building a (potentially large) log message so
+// the formatting work is skipped entirely when the message would be dropped —
+// important on memory-constrained / diskless clients. Matches the server logger.
+func ShouldLog(level LogLevel) bool {
+    return GetLogLevel() >= level
+}
+
+func Fatal(msg string) {
     if GetLogLevel() >= FATAL {
         log.Printf("[%v]: %v", FATAL.string(), msg)
         os.Exit(1)
     }
 }
 
-func LogError(msg string) {
+func Error(msg string) {
     if GetLogLevel() >= ERROR {
         log.Printf("[%v]: %v", ERROR.string(), msg)
     }
 }
 
-func LogWarn(msg string) {
+func Warn(msg string) {
     if GetLogLevel() >= WARN {
         log.Printf("[%v]: %v", WARN.string(), msg)
     }
 }
 
-func LogInfo(msg string) {
+func Info(msg string) {
     if GetLogLevel() >= INFO {
         log.Printf("[%v]: %v", INFO.string(), msg)
     }
 }
 
-func LogDebug(msg string) {
+func Debug(msg string) {
     if GetLogLevel() >= DEBUG {
         log.Printf("[%v]: %v", DEBUG.string(), msg)
     }
 }
 
-func LogTrace(msg string) {
+func Trace(msg string) {
     if GetLogLevel() >= TRACE {
         log.Printf("[%v]: %v", TRACE.string(), msg)
     }

@@ -73,18 +73,18 @@ func enforceBBR(ctx context.Context) {
     _ = exec.Command("/sbin/modprobe", "tcp_"+cc).Run()
     avail, err := os.ReadFile("/proc/sys/net/ipv4/tcp_available_congestion_control")
     if err != nil {
-        logger.LogInfo(fmt.Sprintf("TCP CC: cannot read available algorithms (%v); leaving system default", err))
+        if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("TCP CC: cannot read available algorithms (%v); leaving system default", err)) }
         return
     }
     if !containsField(string(avail), cc) {
-        logger.LogInfo(fmt.Sprintf("TCP CC: %q not available (have: %s); leaving system default", cc, strings.TrimSpace(string(avail))))
+        if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("TCP CC: %q not available (have: %s); leaving system default", cc, strings.TrimSpace(string(avail)))) }
         return
     }
     if err := os.WriteFile("/proc/sys/net/ipv4/tcp_congestion_control", []byte(cc), 0644); err != nil {
-        logger.LogInfo(fmt.Sprintf("TCP CC: failed to set %q (%v); leaving system default", cc, err))
+        if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("TCP CC: failed to set %q (%v); leaving system default", cc, err)) }
         return
     }
-    logger.LogInfo(fmt.Sprintf("TCP CC: host default set to %q for tunnel-tolerant single-stream throughput", cc))
+    if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("TCP CC: host default set to %q for tunnel-tolerant single-stream throughput", cc)) }
 }
 
 // containsField reports whether space-separated list s contains the exact token tok.
@@ -118,10 +118,10 @@ func raiseSysctl(key string, target int) {
         return
     }
     if err := os.WriteFile(path, []byte(strconv.Itoa(target)), 0644); err != nil {
-        logger.LogInfo(fmt.Sprintf("sysctl %s: could not raise to %d (%v); leaving %d", key, target, err, cur))
+        if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("sysctl %s: could not raise to %d (%v); leaving %d", key, target, err, cur)) }
         return
     }
-    logger.LogInfo(fmt.Sprintf("sysctl %s: %d -> %d (UDP buffer for QUIC transport)", key, cur, target))
+    if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("sysctl %s: %d -> %d (UDP buffer for QUIC transport)", key, cur, target)) }
 }
 
 // tuneUDPBuffers raises the UDP socket buffer ceilings so quic-go's large-buffer
@@ -155,12 +155,12 @@ func raiseSysctlTriple(key string, targetMax int) {
     path := "/proc/sys/" + strings.ReplaceAll(key, ".", "/")
     b, err := os.ReadFile(path)
     if err != nil {
-        logger.LogInfo(fmt.Sprintf("sysctl %s: could not read (%v); leaving as-is", key, err))
+        if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("sysctl %s: could not read (%v); leaving as-is", key, err)) }
         return
     }
     fields := strings.Fields(strings.TrimSpace(string(b)))
     if len(fields) != 3 {
-        logger.LogInfo(fmt.Sprintf("sysctl %s: unexpected format %q; leaving as-is", key, string(b)))
+        if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("sysctl %s: unexpected format %q; leaving as-is", key, string(b))) }
         return
     }
     curMax, _ := strconv.Atoi(fields[2])
@@ -169,10 +169,10 @@ func raiseSysctlTriple(key string, targetMax int) {
     }
     val := fmt.Sprintf("%s %s %d", fields[0], fields[1], targetMax)
     if err := os.WriteFile(path, []byte(val), 0644); err != nil {
-        logger.LogInfo(fmt.Sprintf("sysctl %s: could not raise max to %d (%v); leaving %d", key, targetMax, err, curMax))
+        if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("sysctl %s: could not raise max to %d (%v); leaving %d", key, targetMax, err, curMax)) }
         return
     }
-    logger.LogInfo(fmt.Sprintf("sysctl %s: max %d -> %d (inner-TCP BDP over tunnel)", key, curMax, targetMax))
+    if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("sysctl %s: max %d -> %d (inner-TCP BDP over tunnel)", key, curMax, targetMax)) }
 }
 
 // tuneInnerTCPBuffers raises the inner application TCP autotuning ceilings so a
@@ -186,7 +186,7 @@ func tuneInnerTCPBuffers() {
 }
 
 func Bootstrap(ctx context.Context) {
-    logger.LogInfo("Exec bootstrap")
+    if logger.ShouldLog(logger.INFO) { logger.Info("Exec bootstrap") }
     // Optimise the host stack for carrying flows over a userspace QUIC tunnel.
     enforceBBR(ctx)
     tuneUDPBuffers()
@@ -195,15 +195,15 @@ func Bootstrap(ctx context.Context) {
     // prior unclean exit can't accumulate them.
     delAllTable9000Rules()
     cmd := exec.Command("/sbin/ip", "rule", "add", "not", "fwmark", ctx.Value("FWMARK").(string), "table", "9000")
-    logger.LogInfo("Running command: /sbin/ip rule add not fwmark <FWMARK> table 9000")
+    if logger.ShouldLog(logger.INFO) { logger.Info("Running command: /sbin/ip rule add not fwmark <FWMARK> table 9000") }
     _, err := cmd.Output()
     if err != nil {
-        logger.LogFatal(fmt.Sprintf("Error running pre up command: %v", err))
+        logger.Fatal(fmt.Sprintf("Error running pre up command: %v", err))
     }
 }
 
 func RunPostUp(ctx context.Context) {
-    logger.LogInfo("Exec post up")
+    if logger.ShouldLog(logger.INFO) { logger.Info("Exec post up") }
 	enableStatsStr, _ := ctx.Value("ENABLE_STATISTIC").(string)
 	enableStats, _ := strconv.ParseBool(enableStatsStr)
 	if enableStats {
@@ -212,15 +212,15 @@ func RunPostUp(ctx context.Context) {
 }
 
 func GracefullyShutdown() {
-    logger.LogInfo("Exec post down")
+    if logger.ShouldLog(logger.INFO) { logger.Info("Exec post down") }
     // Delete ALL table-9000 rules (loop), not just one — and never fatal, since
     // shutdown can run twice (signal handler + run loop) and the second pass /
     // an already-clean state must not abort us before the table flush.
-    logger.LogInfo("Deleting all ip rule entries for table 9000")
+    if logger.ShouldLog(logger.INFO) { logger.Info("Deleting all ip rule entries for table 9000") }
     delAllTable9000Rules()
-    logger.LogInfo("Flushing routing table 9000")
+    if logger.ShouldLog(logger.INFO) { logger.Info("Flushing routing table 9000") }
     if err := exec.Command("/sbin/ip", "route", "flush", "table", "9000").Run(); err != nil {
-        logger.LogInfo(fmt.Sprintf("table 9000 flush: %v (ok if already empty)", err))
+        if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("table 9000 flush: %v (ok if already empty)", err)) }
     }
 }
 
@@ -258,7 +258,7 @@ func main() {
         host := serverInfo[:portIndex]
         port, err := strconv.Atoi(serverInfo[portIndex+1:])
         if err != nil {
-		    logger.LogFatal(fmt.Sprintf("Failed to parse server port: %v", err))
+		    logger.Fatal(fmt.Sprintf("Failed to parse server port: %v", err))
             os.Exit(1)
         }
         serverHost = host
@@ -266,9 +266,9 @@ func main() {
     }
     var serverIp netip.Addr
     if ip, err := netip.ParseAddr(serverHost); err != nil {
-        logger.LogDebug(fmt.Sprintf("Resolving %v", serverHost))
+        if logger.ShouldLog(logger.DEBUG) { logger.Debug(fmt.Sprintf("Resolving %v", serverHost)) }
         if ips, err := net.LookupIP(serverHost); err != nil {
-            logger.LogFatal(fmt.Sprintf("Failed to resolve server FQDN: %v", err))
+            logger.Fatal(fmt.Sprintf("Failed to resolve server FQDN: %v", err))
             os.Exit(1)
         } else {
             serverIp = netip.MustParseAddr(ips[0].String())
@@ -277,11 +277,11 @@ func main() {
         serverIp = ip
     }
     ctx = context.WithValue(ctx, "SERVER_IP", serverIp.String())
-    logger.LogInfo(fmt.Sprintf("Connecting to %v", serverIp))
+    if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("Connecting to %v", serverIp)) }
 	serverAddr := netip.AddrPortFrom(serverIp, uint16(serverPort))
     enableKeyLog, err := strconv.ParseBool(ctx.Value("ENABLE_KEY_LOG").(string))
     if err != nil {
-		logger.LogError(fmt.Sprintf("Cannot parse ENABLE_KEY_LOG config, default to `false`"))
+		if logger.ShouldLog(logger.ERROR) { logger.Error(fmt.Sprintf("Cannot parse ENABLE_KEY_LOG config, default to `false`")) }
         enableKeyLog = false
     }
     keyLogPath := ctx.Value("KEY_LOG_PATH").(string)
@@ -291,15 +291,15 @@ func main() {
         for {
             select {
             case cerr := <-errChan:
-                logger.LogError(fmt.Sprintf("Encounter error: %v", cerr))
+                if logger.ShouldLog(logger.ERROR) { logger.Error(fmt.Sprintf("Encounter error: %v", cerr)) }
                 cancel()
                 return
             case isRunning := <- isRunningChan:
                 if (isRunning) {
-                    logger.LogInfo("Masque is up")
+                    if logger.ShouldLog(logger.INFO) { logger.Info("Masque is up") }
                     RunPostUp(contxt)
                 } else {
-                    logger.LogInfo("Masque is down")
+                    if logger.ShouldLog(logger.INFO) { logger.Info("Masque is down") }
                     GracefullyShutdown()
                     cancel()
                 	return
@@ -313,7 +313,7 @@ func main() {
             tunnelCount = n
         }
     }
-    logger.LogInfo(fmt.Sprintf("Bonding %d parallel tunnels", tunnelCount))
+    if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("Bonding %d parallel tunnels", tunnelCount)) }
     go func(contxt context.Context) {
         // Reconnect policy: bounded retries, then exit cleanly.
         //
@@ -342,7 +342,7 @@ func main() {
         const stableUptime = 10 * time.Second
         attempts := 0
         giveUp := func(reason string) {
-            logger.LogError(fmt.Sprintf("Out of reconnect attempts (%d/%d): %s; shutting down", attempts, maxAttempts, reason))
+            if logger.ShouldLog(logger.ERROR) { logger.Error(fmt.Sprintf("Out of reconnect attempts (%d/%d): %s; shutting down", attempts, maxAttempts, reason)) }
             GracefullyShutdown()
             cancel()
         }
@@ -354,7 +354,7 @@ func main() {
                     giveUp(fmt.Sprintf("failed to establish bonded MASQUE tunnels: %v", err))
                     return
                 }
-                logger.LogError(fmt.Sprintf("Failed to establish bonded MASQUE tunnels: %v (attempt %d/%d, retry in %v)", err, attempts, maxAttempts, backoff))
+                if logger.ShouldLog(logger.ERROR) { logger.Error(fmt.Sprintf("Failed to establish bonded MASQUE tunnels: %v (attempt %d/%d, retry in %v)", err, attempts, maxAttempts, backoff)) }
                 select {
                 case <-ctx.Done():
                     return
@@ -364,13 +364,13 @@ func main() {
                 continue
 	        }
             backoff = time.Second // connected — reset backoff
-	        logger.LogDebug(fmt.Sprintf("Created TUN device: %s with %d bonded tunnels", devs[0].Name(), len(conns)))
+	        if logger.ShouldLog(logger.DEBUG) { logger.Debug(fmt.Sprintf("Created TUN device: %s with %d bonded tunnels", devs[0].Name(), len(conns))) }
             upTime := time.Now()
             eChan := make(chan error, runtime.NumCPU() + tunnelCount + 1)
 			connCtx, connCancel := context.WithCancel(ctx)
             go func() {
                 cerr := <-eChan
-                logger.LogError(fmt.Sprintf("Tunneling error: %v", cerr))
+                if logger.ShouldLog(logger.ERROR) { logger.Error(fmt.Sprintf("Tunneling error: %v", cerr)) }
 				connCancel()
 				for _, c := range conns {
 					c.Close()
@@ -468,13 +468,13 @@ func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverF
     if enableKeyLog {
         keyLogPath := ctx.Value("KEY_LOG_PATH").(string)
         if keyLogPath == "" {
-		    logger.LogError(fmt.Sprintf("Cannot parse KEY_LOG_PATH config, default to `keys.txt`"))
+		    if logger.ShouldLog(logger.ERROR) { logger.Error(fmt.Sprintf("Cannot parse KEY_LOG_PATH config, default to `keys.txt`")) }
             keyLogPath = "keys.txt"
         }
         keyLog, err := os.Create(keyLogPath)
 	    defer keyLog.Close()
 	    if err != nil {
-		    logger.LogError(fmt.Sprintf("failed to create key log file: %v", err))
+		    if logger.ShouldLog(logger.ERROR) { logger.Error(fmt.Sprintf("failed to create key log file: %v", err)) }
 	    }
         tlsConf.KeyLogWriter = keyLog
     }
@@ -523,7 +523,7 @@ func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverF
 	if rsp.StatusCode != http.StatusOK {
 		return nil, nil, nil, fmt.Errorf("unexpected status code: %d", rsp.StatusCode)
 	}
-	logger.LogDebug(fmt.Sprintf("connected to VPN server: %s", serverAddr))
+	if logger.ShouldLog(logger.DEBUG) { logger.Debug(fmt.Sprintf("connected to VPN server: %s", serverAddr)) }
 
 	routes, err := ipconn.Routes(ctx)
 	if err != nil {
@@ -657,10 +657,10 @@ func establishTunTapAndRoutes(ctx context.Context, routes []connectip.IPRoute, l
     }
 
 	for _, route := range routes {
-		logger.LogDebug(fmt.Sprintf("adding routes for %s - %s (protocol: %d)", route.StartIP, route.EndIP, route.IPProtocol))
+		if logger.ShouldLog(logger.DEBUG) { logger.Debug(fmt.Sprintf("adding routes for %s - %s (protocol: %d)", route.StartIP, route.EndIP, route.IPProtocol)) }
 		for _, prefix := range route.Prefixes() {
             cmd := exec.Command("/sbin/ip", "route", "add", prefix.String() , "dev", devName, "table", "9000")
-            logger.LogInfo(fmt.Sprintf("Adding route: %v", prefix.String()))
+            if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("Adding route: %v", prefix.String())) }
             _, err := cmd.Output()
             if err != nil {
                 return nil, fmt.Errorf("Failed to add route: %v", err)
@@ -706,7 +706,7 @@ func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interfac
 							gPct = 100 * float64(gGen) / float64(gTot)
 							rPct = 100 * float64(gRetr) / float64(gTot)
 						}
-						logger.LogInfo(fmt.Sprintf("pre-reseq: total=%d ooo=%d (%.1f%%) | genuine: %d/%d (%.2f%%) retr: %d (%.2f%%)", tot, ooo, pct, gGen, gTot, gPct, gRetr, rPct))
+						if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("pre-reseq: total=%d ooo=%d (%.1f%%) | genuine: %d/%d (%.2f%%) retr: %d (%.2f%%)", tot, ooo, pct, gGen, gTot, gPct, gRetr, rPct)) }
 					}
 				}
 			}()
