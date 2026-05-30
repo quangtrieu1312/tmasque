@@ -133,11 +133,64 @@ func tuneUDPBuffers() {
     raiseSysctl("net.core.wmem_max", udpBufTarget)
 }
 
+// innerTCPBufTarget is the autotuning ceiling (max field of tcp_wmem/tcp_rmem) we
+// want for the INNER application TCP flows carried over the tunnel — distinct from
+// the QUIC UDP socket buffers above. The tunnel adds RTT on top of the bare path,
+// so the inner TCP's bandwidth-delay product is larger than on a direct connection:
+// at ~800 Mbit/s over a ~35 ms tunnel RTT the BDP is ~3.4 MB, and Linux autotuning
+// only ever grows a connection's buffer to ~half the max (the rest is reserved for
+// metadata/skb overhead). The stock tcp_wmem max of 4 MB therefore leaves a single
+// stream sndbuf-limited (measured: ss reports sndbuf_limited rising; goodput pins at
+// ~430 Mbit/s while BBR's own bandwidth estimate is ~800). 32 MB gives autotuning the
+// headroom to cover the tunnel BDP, lifting single-stream upload from ~430 to ~850
+// (WireGuard-parity). WireGuard happens to fit in 4 MB because its path RTT is lower.
+const innerTCPBufTarget = 33554432 // 32 MB
+
+// raiseSysctlTriple raises the third (max) field of a "min default max" sysctl such
+// as tcp_wmem/tcp_rmem to target, preserving the min and default fields. Raise-only
+// and best-effort, mirroring raiseSysctl. The kernel uses the max field as the
+// autotuning ceiling for SO_SNDBUF/SO_RCVBUF, so this is what unblocks a single
+// high-BDP flow without forcing a large buffer onto every socket.
+func raiseSysctlTriple(key string, targetMax int) {
+    path := "/proc/sys/" + strings.ReplaceAll(key, ".", "/")
+    b, err := os.ReadFile(path)
+    if err != nil {
+        logger.LogInfo(fmt.Sprintf("sysctl %s: could not read (%v); leaving as-is", key, err))
+        return
+    }
+    fields := strings.Fields(strings.TrimSpace(string(b)))
+    if len(fields) != 3 {
+        logger.LogInfo(fmt.Sprintf("sysctl %s: unexpected format %q; leaving as-is", key, string(b)))
+        return
+    }
+    curMax, _ := strconv.Atoi(fields[2])
+    if curMax >= targetMax {
+        return
+    }
+    val := fmt.Sprintf("%s %s %d", fields[0], fields[1], targetMax)
+    if err := os.WriteFile(path, []byte(val), 0644); err != nil {
+        logger.LogInfo(fmt.Sprintf("sysctl %s: could not raise max to %d (%v); leaving %d", key, targetMax, err, curMax))
+        return
+    }
+    logger.LogInfo(fmt.Sprintf("sysctl %s: max %d -> %d (inner-TCP BDP over tunnel)", key, curMax, targetMax))
+}
+
+// tuneInnerTCPBuffers raises the inner application TCP autotuning ceilings so a
+// single TCP stream carried over the tunnel can fill the tunnel's (larger) BDP. See
+// innerTCPBufTarget — without this a single stream is sndbuf-limited to ~half of
+// WireGuard. Raise-only; the min/default fields are preserved so idle sockets stay
+// small and only high-BDP flows grow into the headroom.
+func tuneInnerTCPBuffers() {
+    raiseSysctlTriple("net.ipv4.tcp_wmem", innerTCPBufTarget)
+    raiseSysctlTriple("net.ipv4.tcp_rmem", innerTCPBufTarget)
+}
+
 func Bootstrap(ctx context.Context) {
     logger.LogInfo("Exec bootstrap")
     // Optimise the host stack for carrying flows over a userspace QUIC tunnel.
     enforceBBR(ctx)
     tuneUDPBuffers()
+    tuneInnerTCPBuffers()
     // Clear any stale/duplicate table-9000 rules first so repeated attempts or a
     // prior unclean exit can't accumulate them.
     delAllTable9000Rules()
@@ -401,7 +454,11 @@ func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverF
 		tlsConf,
 		&quic.Config{
 			EnableDatagrams:   true,
-			InitialPacketSize: 1400,
+			// 1452 = quic-go MaxPacketBufferSize → datagram budget ~1415, matching
+			// the server so a 1400-MTU inner packet fits both directions. (Was 1400
+			// → budget ~1363; upload survived only because the client leaves PMTUD
+			// enabled and probes upward. Pinning to the max is deterministic.)
+			InitialPacketSize: 1452,
             MaxIdleTimeout:  30 * time.Second,
             KeepAlivePeriod: 10 * time.Second,
 			InitialStreamReceiveWindow:     10 * 1024 * 1024,  // 10 MB
@@ -536,14 +593,16 @@ func establishTunTapAndRoutes(ctx context.Context, routes []connectip.IPRoute, l
     	devs[i] = dev
 	}
 
-    // Tunnel link MTU, read from config (TUNNEL_MTU) like the server does; default
-    // 1416 to MATCH the server (the old hardcoded 1252 was below both the server's
-    // 1416 and connect-ip's minMTU=1280, needlessly shrinking the client's egress MSS).
-    // Per draft-ietf-masque-connect-ip the CONNECT-IP encap overhead is ≤51B; with
-    // IPv4+UDP (28B) that leaves up to 1421 on a 1500 path, so 1416 is safe (verified:
-    // 6/6 consistent uploads to a forwarded external target). Ops can lower it via the
-    // config for client paths with a smaller real MTU. Floor 576 (IPv4 min datagram).
-    mtu := 1416
+    // Tunnel link MTU, read from config (TUNNEL_MTU) like the server does.
+    // Default 1413 = the MAX inner-IP packet that fits a QUIC DATAGRAM on a 1500
+    // WAN: quic-go caps the QUIC packet at MaxPacketBufferSize=1452 (below the
+    // wire's 1472), datagram budget = 1452-1(type)-20(maxConnID)-16(AEAD)=1415,
+    // minus QSID(1)+connect-ip contextID(1) varints = 1413. The QUIC send budget
+    // is pinned by InitialPacketSize:1452 above (PMTUD can't lift it on the
+    // AF_XDP server). NOTE: if connect-ip SequencingEnabled is turned on it adds
+    // 4B → drop this to 1409. Ops can lower it via config for smaller real paths.
+    // Floor 576 (IPv4 min datagram).
+    mtu := 1413
     if v := ctx.Value("TUNNEL_MTU"); v != nil {
         if m, perr := strconv.ParseUint(v.(string), 10, 64); perr == nil && m >= 576 {
             mtu = int(m)

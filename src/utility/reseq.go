@@ -246,3 +246,63 @@ func parseTCP(ip []byte) (seq, nextAfter uint32, key flowKey, ok bool) {
 	key[12] = 6                // proto
 	return seq, seq + uint32(consumed), key, true
 }
+
+// --- Seen-set genuine reorder observer (ported from server utility/reseq.go) ---
+// Distinguishes retransmits (seq already in per-flow ring) from genuine reorder.
+
+var (
+	PreSendTotal   atomic.Uint64
+	PreSendGenuine atomic.Uint64
+	PreSendRetr    atomic.Uint64
+)
+
+const preSendRingSize = 1024
+
+type preSendFlow struct {
+	maxSeq uint32
+	ring   [preSendRingSize]uint32
+	in     map[uint32]struct{}
+	head   int
+	count  int
+}
+
+type PreSendGenuineObserver struct {
+	flows map[flowKey]*preSendFlow
+}
+
+func NewPreSendGenuineObserver() *PreSendGenuineObserver {
+	return &PreSendGenuineObserver{flows: make(map[flowKey]*preSendFlow)}
+}
+
+func (o *PreSendGenuineObserver) Observe(ip []byte) {
+	seq, _, key, ok := parseTCP(ip)
+	if !ok {
+		return
+	}
+	PreSendTotal.Add(1)
+	f, exists := o.flows[key]
+	if !exists {
+		if len(o.flows) >= 256 {
+			o.flows = make(map[flowKey]*preSendFlow)
+		}
+		f = &preSendFlow{in: make(map[uint32]struct{}, preSendRingSize)}
+		o.flows[key] = f
+	}
+	if _, dup := f.in[seq]; dup {
+		PreSendRetr.Add(1)
+		return
+	}
+	if f.count == preSendRingSize {
+		delete(f.in, f.ring[f.head])
+	} else {
+		f.count++
+	}
+	f.ring[f.head] = seq
+	f.head = (f.head + 1) % preSendRingSize
+	f.in[seq] = struct{}{}
+	if f.count == 1 || int32(seq-f.maxSeq) >= 0 {
+		f.maxSeq = seq
+		return
+	}
+	PreSendGenuine.Add(1)
+}
