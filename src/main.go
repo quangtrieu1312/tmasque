@@ -262,6 +262,7 @@ func main() {
         on, _ := strconv.ParseBool(v)
         stats.Enable(on)
     }
+    config.Watch(ctx) // hot-reload LOG_LEVEL + ENABLE_STATISTIC on config-file change
     serverInfo := ctx.Value("SERVER").(string)
     serverHost := serverInfo
     serverPort := 443
