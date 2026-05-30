@@ -1,9 +1,11 @@
 [submodule "lib/connect-ip-go"]
 	path = lib/connect-ip-go
 	url = git@github.com:quangtrieu1312/connect-ip-go
+	branch = master
 [submodule "lib/quic-go"]
 	path = lib/quic-go
 	url = git@github.com:quangtrieu1312/quic-go
+	branch = master
 [submodule "lib/water"]
 	path = lib/water
 	url = git@github.com:quangtrieu1312/water

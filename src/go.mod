@@ -8,7 +8,7 @@ require (
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8
 	github.com/vishvananda/netlink v1.3.0
 	github.com/yosida95/uritemplate/v3 v3.0.2
-	golang.org/x/sys v0.35.0
+	golang.org/x/sys v0.45.0
 )
 
 replace github.com/quic-go/connect-ip-go => ../lib/connect-ip-go
@@ -19,9 +19,9 @@ require (
 	github.com/dunglas/httpsfv v1.0.2 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/vishvananda/netns v0.0.4 // indirect
-	golang.org/x/crypto v0.41.0 // indirect
-	golang.org/x/net v0.43.0 // indirect
-	golang.org/x/text v0.28.0 // indirect
+	golang.org/x/crypto v0.51.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
 )
 
 replace github.com/songgao/water => ../lib/water
