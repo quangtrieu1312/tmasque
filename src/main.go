@@ -36,6 +36,7 @@ import (
 	"github.com/quangtrieu1312/tmasque/config"
 	"github.com/quangtrieu1312/tmasque/constants"
 	"github.com/quangtrieu1312/tmasque/logger"
+	"github.com/quangtrieu1312/tmasque/stats"
 	"github.com/quangtrieu1312/tmasque/utility"
 )
 
@@ -259,7 +260,7 @@ func main() {
     // Enable the STATISTIC log channel + per-packet observers when configured.
     if v, _ := ctx.Value("ENABLE_STATISTIC").(string); v != "" {
         on, _ := strconv.ParseBool(v)
-        logger.SetStatistic(on)
+        stats.Enable(on)
     }
     serverInfo := ctx.Value("SERVER").(string)
     serverHost := serverInfo
@@ -720,7 +721,7 @@ func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interfac
 							gPct = 100 * float64(gGen) / float64(gTot)
 							rPct = 100 * float64(gRetr) / float64(gTot)
 						}
-						if logger.ShouldLog(logger.STATISTIC) { logger.Statistic(fmt.Sprintf("pre-reseq: total=%d ooo=%d (%.1f%%) | genuine: %d/%d (%.2f%%) retr: %d (%.2f%%)", tot, ooo, pct, gGen, gTot, gPct, gRetr, rPct)) }
+						if stats.ShouldLog() { stats.Statistic(fmt.Sprintf("pre-reseq: total=%d ooo=%d (%.1f%%) | genuine: %d/%d (%.2f%%) retr: %d (%.2f%%)", tot, ooo, pct, gGen, gTot, gPct, gRetr, rPct)) }
 					}
 				}
 			}()
@@ -767,7 +768,7 @@ func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interfac
 					}
 					return
 				}
-				if logger.ShouldLog(logger.STATISTIC) {
+				if stats.ShouldLog() {
 					obs.Observe(b[:m])
 					genObs.Observe(b[:m])
 				}
