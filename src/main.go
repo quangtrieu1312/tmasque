@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -243,6 +244,10 @@ func main() {
     logPath := constants.LOG_PATH
     logger.UpdateLogLevelName(logLevel)
     logger.UpdateLogPath(logPath)
+    // Create the log directory if missing (a diskless / ramdisk host may boot with it absent).
+    if dir := filepath.Dir(logPath); dir != "." && dir != "" {
+        os.MkdirAll(dir, 0755)
+    }
     f, err := os.OpenFile(logger.GetLogPath(), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
     if err != nil {
         log.Fatalf("Error opening file: %v", err)
@@ -279,12 +284,17 @@ func main() {
     ctx = context.WithValue(ctx, "SERVER_IP", serverIp.String())
     if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("Connecting to %v", serverIp)) }
 	serverAddr := netip.AddrPortFrom(serverIp, uint16(serverPort))
-    enableKeyLog, err := strconv.ParseBool(ctx.Value("ENABLE_KEY_LOG").(string))
-    if err != nil {
-		if logger.ShouldLog(logger.ERROR) { logger.Error(fmt.Sprintf("Cannot parse ENABLE_KEY_LOG config, default to `false`")) }
-        enableKeyLog = false
+    // QUIC key logging is opt-in. If the config keys are absent the feature stays
+    // disabled — and we read ctx via the comma-ok form so a missing key can't panic
+    // a type assertion (which is what made the client unable to start without them).
+    enableKeyLog := false
+    if v, ok := ctx.Value("ENABLE_KEY_LOG").(string); ok {
+        enableKeyLog, _ = strconv.ParseBool(v)
     }
-    keyLogPath := ctx.Value("KEY_LOG_PATH").(string)
+    keyLogPath := ""
+    if v, ok := ctx.Value("KEY_LOG_PATH").(string); ok {
+        keyLogPath = v
+    }
     errChan := make(chan error)
     isRunningChan := make(chan bool)
     go func(contxt context.Context) {
@@ -466,17 +476,20 @@ func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverF
 		Certificates:       []tls.Certificate{cert},
     }
     if enableKeyLog {
-        keyLogPath := ctx.Value("KEY_LOG_PATH").(string)
         if keyLogPath == "" {
-		    if logger.ShouldLog(logger.ERROR) { logger.Error(fmt.Sprintf("Cannot parse KEY_LOG_PATH config, default to `keys.txt`")) }
             keyLogPath = "keys.txt"
         }
+        // Create the parent dir + file before QUIC writes to it.
+        if dir := filepath.Dir(keyLogPath); dir != "." && dir != "" {
+            os.MkdirAll(dir, 0755)
+        }
         keyLog, err := os.Create(keyLogPath)
-	    defer keyLog.Close()
-	    if err != nil {
-		    if logger.ShouldLog(logger.ERROR) { logger.Error(fmt.Sprintf("failed to create key log file: %v", err)) }
-	    }
-        tlsConf.KeyLogWriter = keyLog
+        if err != nil {
+		    if logger.ShouldLog(logger.ERROR) { logger.Error(fmt.Sprintf("failed to create key log file %q: %v", keyLogPath, err)) }
+        } else {
+            defer keyLog.Close()
+            tlsConf.KeyLogWriter = keyLog
+        }
     }
 	dialCtx, dialCancel := context.WithTimeout(ctx, 1*time.Second)
 	defer dialCancel()
