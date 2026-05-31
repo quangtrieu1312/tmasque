@@ -14,22 +14,28 @@ device.
 ## How it works
 
 ```
-        application traffic
-              │
-        ┌─────▼──────┐   policy routing (fwmark / table) sends matched
-        │  TUN dev   │   dst prefixes here instead of the default route
-        └─────┬──────┘
-   read ──────┤────── write
-         │    │           ▲
-         ▼    │           │
-   ┌──────────┴───────────┴──────┐
-   │  tmasque                     │   per-packet:
-   │   TUN read → QUIC DATAGRAM ──┼──► encap inner IP into a connect-ip
-   │   QUIC DATAGRAM → TUN write ◄┼──  context-0 datagram, send over QUIC
-   └──────────────┬───────────────┘
-                  │  QUIC / UDP :443, HTTP/3 CONNECT-IP, mTLS (Ed25519)
-                  ▼
-              tmasqued (server)  ──►  WAN
+                              application traffic
+                                      |     ^
+                                      v     |
+             +------------------------------------------------------------+
+             |   TUN dev  - policy routing (fwmark / table) steers        |
+             |              matched dst prefixes here, not the            |
+             |              default route                                 |
+             +------------------------------------------------------------+
+                                      |     ^
+                                      v     |   read = down,  write = up
+             +------------------------------------------------------------+
+             |   tmasque                                                  |
+             |     read   ->  encap inner IP into a connect-ip            |
+             |                context-0 QUIC DATAGRAM   (send)            |
+             |     write  <-  decap inner IP from such a                  |
+             |                QUIC DATAGRAM             (recv)            |
+             +------------------------------------------------------------+
+                                      |     ^
+                                      v     |   QUIC / UDP :443, HTTP/3 CONNECT-IP, mTLS
+             +------------------------------------------------------------+
+             |   tmasqued (server)                       -->   WAN        |
+             +------------------------------------------------------------+
 ```
 
 On connect the client receives its address and routes from the server and installs them
