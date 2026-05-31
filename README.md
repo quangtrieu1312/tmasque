@@ -47,9 +47,12 @@ prefixes is steered into the TUN.
 
 ## Design notes
 
-- **Outer transport: QUIC with BBR.** The tunnel's QUIC connection uses BBR congestion
-  control; the *inner* traffic keeps its own end-to-end congestion control. Inner IP rides
-  unreliable **QUIC DATAGRAMs** (no head-of-line blocking, no tunnel-level retransmission).
+- **Inner-TCP congestion control: BBR.** At startup the client sets the *host's* TCP
+  congestion control to BBR (`net.ipv4.tcp_congestion_control`), because BBR's rate/RTT
+  model tolerates the small non-congestive loss/reorder a userspace tunnel adds (loss-based
+  CUBIC would collapse). Inner IP rides unreliable **QUIC DATAGRAMs** (no head-of-line
+  blocking, no tunnel-level retransmission); the outer QUIC connection itself uses quic-go's
+  default (CUBIC).
 - **Reconnect & fail-open exit.** The client retries with capped exponential backoff,
   resetting its budget once a connection has been stable, so transient loss recovers
   without intervention. After `RECONNECT_ATTEMPTS` consecutive failures (default 3) it
@@ -60,7 +63,7 @@ prefixes is steered into the TUN.
   `tcp_wmem`/`tcp_rmem` at bootstrap so a single inner upload isn't send-buffer limited.
 - **MTU.** The TUN MTU is sized to the QUIC datagram payload budget so inner packets never
   exceed it (an over-large MTU silently drops datagrams).
-- **GSO/GRO-capable TUN.** Uses a `water` fork with `IFF_VNET_HDR` + offload split (gated).
+- **GSO/GRO-capable TUN.** Uses a `water` fork with `IFF_VNET_HDR` + offload split (opt-in via `TUN_GSO`, off by default).
 - **Config & hot-reload.** Keys live in `tmasque.conf`. `LOG_LEVEL` and `ENABLE_STATISTIC`
   are hot-reloaded on save (inotify); everything else needs a restart. QUIC TLS key logging
   is off unless `KEY_LOG_PATH` is set (the file and its directory are created on connect).
@@ -86,7 +89,7 @@ prefixes is steered into the TUN.
 sudo ./build/tmasque             # reads /etc/tmasque/tmasque.conf
 ```
 
-Requires Linux with TUN support and `NET_ADMIN` + `NET_RAW`. The client expects its config
+Requires Linux with TUN support and `NET_ADMIN` (the client uses no raw sockets). The client expects its config
 at `/etc/tmasque/tmasque.conf` and its certs (`ca.crt`, `client.crt`, `client.key`) under
 `/etc/tmasque/certs/` — these come from the `bundle.zip` the server's `genClient` produces.
 A `Vagrantfile` is included for bare-metal VM testing, and `packaging/alpine/` builds an

@@ -226,6 +226,54 @@ func GracefullyShutdown() {
     }
 }
 
+// Adaptive MTU (mirrors the server): derived at startup from the egress WAN link
+// MTU to the server, capped to the XDP-native virtio limit (the server is
+// XDP-native, so it can't accept outer packets > that). NOT hardcoded — a 1500/1G
+// underlay yields ~1420 inner / ~1472 outer; an admin-set jumbo underlay yields
+// more. The admin sets the WAN MTU; tmasque only scales down to a safe value.
+var clientTunnelMTU int = 1420
+var clientInitialPacketSize int = 1452
+
+const (
+	xdpNativeMaxMTU  = 3506 // server is virtio XDP-native; the path can't exceed this
+	outerOverhead    = 56   // IP20+UDP8 + 28B path-safety margin (IP pkt must stay UNDER MTU)
+	datagramOverhead = 52   // QUIC short hdr + pktnum + AEAD + connect-ip ctx/seq
+	maxQUICPacket    = 4000 // == quic-go protocol.MaxPacketBufferSize in our fork
+)
+
+// deriveTunnelMTU sets the inner tun MTU AND the QUIC InitialPacketSize from the
+// egress WAN link MTU to the server, capped to xdpNativeMaxMTU. Both are PINNED
+// (derived, not hardcoded -> 1500 link yields ~1420/1472, jumbo link yields more):
+// PMTUD is left enabled and may probe higher, but we must pin InitialPacketSize so
+// the SendDatagram budget is correct from the first packet. Relying on PMTUD's
+// gradual ramp instead measured ~30% slower (inner tun is jumbo immediately, but
+// the budget starts at the 1452 floor -> big datagrams dropped until PMTUD grows).
+// Fallback 1500 if the route can't be resolved.
+func deriveTunnelMTU(serverIP net.IP) {
+	eff := 1500
+	if routes, e := netlink.RouteGet(serverIP); e == nil && len(routes) > 0 {
+		if l, e2 := netlink.LinkByIndex(routes[0].LinkIndex); e2 == nil && l.Attrs().MTU > 0 {
+			eff = l.Attrs().MTU
+		}
+	}
+	if eff > xdpNativeMaxMTU {
+		eff = xdpNativeMaxMTU
+	}
+	ips := eff - outerOverhead // QUIC outer pkt stays safely under the WAN MTU
+	if ips > maxQUICPacket {
+		ips = maxQUICPacket
+	}
+	if ips < 1252 {
+		ips = 1252
+	}
+	clientInitialPacketSize = ips
+	inner := ips - datagramOverhead // inner fits one DATAGRAM in the outer packet
+	if inner < 576 {
+		inner = 576
+	}
+	clientTunnelMTU = inner
+}
+
 func main() {
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
@@ -289,6 +337,8 @@ func main() {
         serverIp = ip
     }
     ctx = context.WithValue(ctx, "SERVER_IP", serverIp.String())
+    deriveTunnelMTU(net.IP(serverIp.AsSlice()))
+    if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("MTU: inner tun=%d (auto from WAN); outer QUIC sized by PMTUD", clientTunnelMTU)) }
     if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("Connecting to %v", serverIp)) }
 	serverAddr := netip.AddrPortFrom(serverIp, uint16(serverPort))
     // QUIC key logging is opt-in via KEY_LOG_PATH: set it to a path to enable (the
@@ -320,12 +370,21 @@ func main() {
             }
         }
     }(ctx)
-    tunnelCount := 4
-    if v := ctx.Value("TUNNEL_COUNT"); v != nil {
-        if n, perr := strconv.Atoi(v.(string)); perr == nil && n > 0 {
-            tunnelCount = n
-        }
-    }
+    // Tunnel count is pinned to 1 — a single QUIC connection per client.
+    //
+    // TUNNEL_COUNT > 1 (bonding N parallel tunnels) is EXPERIMENTAL and HARMS
+    // throughput: striping one inner flow across multiple QUIC connections
+    // introduces cross-tunnel reorder, and since the tunnel carries inner TCP in
+    // unreliable QUIC datagrams, that reorder reads as loss to the inner TCP and
+    // collapses its cwnd. Measured: TUNNEL_COUNT=4 was no faster than =1 (it just
+    // added reorder). So the config read is intentionally disabled; do not wire it
+    // back up without first fixing per-flow affinity across the bonded tunnels.
+    tunnelCount := 1
+    // if v := ctx.Value("TUNNEL_COUNT"); v != nil {
+    //     if n, perr := strconv.Atoi(v.(string)); perr == nil && n > 0 {
+    //         tunnelCount = n
+    //     }
+    // }
     if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("Bonding %d parallel tunnels", tunnelCount)) }
     go func(contxt context.Context) {
         // Reconnect policy: bounded retries, then exit cleanly.
@@ -507,7 +566,11 @@ func establishMASQUEConn(ctx context.Context, serverAddr netip.AddrPort, serverF
 			// the server so a 1400-MTU inner packet fits both directions. (Was 1400
 			// → budget ~1363; upload survived only because the client leaves PMTUD
 			// enabled and probes upward. Pinning to the max is deterministic.)
-			InitialPacketSize: 1452,
+			// Pinned to the WAN-derived size so the SendDatagram budget is correct
+			// immediately (PMTUD's gradual ramp measured ~30% slower for jumbo —
+			// the inner tun is jumbo at once but the budget would start at 1452).
+			// Derived from the WAN MTU, so it's 1500/1G-safe (not a hardcoded jumbo).
+			InitialPacketSize: uint16(clientInitialPacketSize),
             MaxIdleTimeout:  30 * time.Second,
             KeepAlivePeriod: 10 * time.Second,
 			InitialStreamReceiveWindow:     10 * 1024 * 1024,  // 10 MB
@@ -651,7 +714,7 @@ func establishTunTapAndRoutes(ctx context.Context, routes []connectip.IPRoute, l
     // AF_XDP server). NOTE: if connect-ip SequencingEnabled is turned on it adds
     // 4B → drop this to 1409. Ops can lower it via config for smaller real paths.
     // Floor 576 (IPv4 min datagram).
-    mtu := 1413
+    mtu := clientTunnelMTU // auto-derived from WAN MTU (deriveTunnelMTU); TUNNEL_MTU overrides
     if v := ctx.Value("TUNNEL_MTU"); v != nil {
         if m, perr := strconv.ParseUint(v.(string), 10, 64); perr == nil && m >= 576 {
             mtu = int(m)
@@ -739,7 +802,7 @@ func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interfac
 	for i, c := range conns {
 		go func(c *connectip.Conn, id int) {
 			dev := devs[id%len(devs)]
-			b := make([]byte, 1500)
+			b := make([]byte, 4096)
 			// Measure reorder AS QUIC delivers it, before reseq reorders, to tell
 			// transport reorder apart from reseq-introduced reorder.
 			obs := utility.NewPreReseqObserver()
@@ -797,7 +860,7 @@ func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interfac
 	// comes back on the same tunnel (must match server flowHashSym exactly).
 	for i, dev := range devs {
 		go func(d *water.Interface, id int) {
-			b := make([]byte, 1500)
+			b := make([]byte, 4096)
 			for {
 				m, err := d.Read(b)
 				if err != nil {
