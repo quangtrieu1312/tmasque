@@ -738,11 +738,13 @@ func establishTunTapAndRoutes(ctx context.Context, routes []connectip.IPRoute, l
 	for _, route := range routes {
 		if logger.ShouldLog(logger.DEBUG) { logger.Debug(fmt.Sprintf("adding routes for %s - %s (protocol: %d)", route.StartIP, route.EndIP, route.IPProtocol)) }
 		for _, prefix := range route.Prefixes() {
-            cmd := exec.Command("/sbin/ip", "route", "add", prefix.String() , "dev", devName, "table", "9000")
+            // `replace` (not `add`) so reconnects are idempotent: a stale route for this
+            // prefix left in table 9000 by a prior session must not fail setup with
+            // "File exists" (exit status 2) and spuriously burn a reconnect attempt.
+            cmd := exec.Command("/sbin/ip", "route", "replace", prefix.String() , "dev", devName, "table", "9000")
             if logger.ShouldLog(logger.INFO) { logger.Info(fmt.Sprintf("Adding route: %v", prefix.String())) }
-            _, err := cmd.Output()
-            if err != nil {
-                return nil, fmt.Errorf("Failed to add route: %v", err)
+            if out, err := cmd.CombinedOutput(); err != nil {
+                return nil, fmt.Errorf("Failed to add route %s: %v: %s", prefix.String(), err, string(out))
             }
 		}
 	}
