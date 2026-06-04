@@ -266,7 +266,7 @@ var clientInitialPacketSize int = 1452
 const (
 	xdpNativeMaxMTU  = 3506 // server is virtio XDP-native; the path can't exceed this
 	outerOverhead    = 56   // IP20+UDP8 + 28B path-safety margin (IP pkt must stay UNDER MTU)
-	datagramOverhead = 52   // QUIC short hdr + pktnum + AEAD + connect-ip ctx/seq
+	datagramOverhead = 28   // MEASURED on the wire: outer UDP payload = inner+28 (QUIC short hdr+pktnum + DATAGRAM frame + connect-ip ctx + AEAD16). Was 52 (over-reserved 24B).
 	maxQUICPacket    = 4000 // == quic-go protocol.MaxPacketBufferSize in our fork
 )
 
