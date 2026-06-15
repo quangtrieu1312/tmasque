@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"expvar"
 	"fmt"
 	"io"
 	"log"
@@ -432,7 +433,7 @@ func main() {
         // single-never-reset counter); only consecutive failures with no stable connection
         // between them exhaust it. Backoff is capped-exponential.
         // Tune via RECONNECT_ATTEMPTS (default 3 when unset).
-        maxAttempts := 3
+        maxAttempts := 1 // no retry: a failed/dropped attempt gives up rather than spawning orphan connections (server orphans never idle-timeout). Override via RECONNECT_ATTEMPTS.
         if v := contxt.Value("RECONNECT_ATTEMPTS"); v != nil {
             if n, perr := strconv.Atoi(v.(string)); perr == nil && n > 0 {
                 maxAttempts = n
@@ -818,7 +819,23 @@ func tunnel(ctx context.Context, conns []*connectip.Conn, devs []*water.Interfac
 							gPct = 100 * float64(gGen) / float64(gTot)
 							rPct = 100 * float64(gRetr) / float64(gTot)
 						}
-						if stats.ShouldLog() { stats.Statistic(fmt.Sprintf("pre-reseq: total=%d ooo=%d (%.1f%%) | genuine: %d/%d (%.2f%%) retr: %d (%.2f%%)", tot, ooo, pct, gGen, gTot, gPct, gRetr, rPct)) }
+						// dg-send / dg-packer: the CLIENT's own upload SEND order (quic-go
+						// expvars). dg-send = at Pop (commit to packet); dg-packer = final
+						// wire order (post-shuffle). If these show genuine ~0 but the gw's
+						// dg_rcvin shows ~8%, the reorder enters AFTER the client send (transit
+						// / gw); if they match ~8%, the client emits datagrams out of order.
+						ev := func(name string) int64 {
+							if iv, ok := expvar.Get(name).(*expvar.Int); ok && iv != nil {
+								return iv.Value()
+							}
+							return 0
+						}
+						dsT, dsG, dsR := ev("dg_send_total"), ev("dg_send_genuine"), ev("dg_send_retr")
+						dpT, dpG := ev("dg_packer_total"), ev("dg_packer_genuine")
+						dsPct, dpPct := 0.0, 0.0
+						if dsT > 0 { dsPct = 100 * float64(dsG) / float64(dsT) }
+						if dpT > 0 { dpPct = 100 * float64(dpG) / float64(dpT) }
+						if stats.ShouldLog() { stats.Statistic(fmt.Sprintf("pre-reseq: total=%d ooo=%d (%.1f%%) | genuine: %d/%d (%.2f%%) retr: %d (%.2f%%) | dg-send: gen=%d/%d (%.2f%%) retr=%d | dg-packer: gen=%d/%d (%.2f%%)", tot, ooo, pct, gGen, gTot, gPct, gRetr, rPct, dsG, dsT, dsPct, dsR, dpG, dpT, dpPct)) }
 					}
 				}
 			}()

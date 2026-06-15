@@ -15,28 +15,24 @@ device.
 ## How it works
 
 ```
-                              application traffic
-                                      |     ^
-                                      v     |
-             +------------------------------------------------------------+
-             |   TUN dev  - policy routing (fwmark / table) steers        |
-             |              matched dst prefixes here, not the            |
-             |              default route                                 |
-             +------------------------------------------------------------+
-                                      |     ^
-                                      v     |   read = down,  write = up
-             +------------------------------------------------------------+
-             |   tmasque                                                  |
-             |     read   ->  encap inner IP into a connect-ip            |
-             |                context-0 QUIC DATAGRAM   (send)            |
-             |     write  <-  decap inner IP from such a                  |
-             |                QUIC DATAGRAM             (recv)            |
-             +------------------------------------------------------------+
-                                      |     ^
-                                      v     |   QUIC / UDP :443, HTTP/3 CONNECT-IP, mTLS
-             +------------------------------------------------------------+
-             |   tmasqued (server)                       -->   WAN        |
-             +------------------------------------------------------------+
+┌─ tmasque (client) ─────────────────────┐
+│              application               │
+│              (1) │   ▲ (2)             │
+│                  ▼   │                 │
+│               TUN device               │
+│                  │   ▲                 │
+│                  ▼   │                 │
+│           tmasque  (process)           │
+└────────────────────────────────────────┘
+               (1) │   ▲ (2)
+                   │   │   QUIC / UDP :443
+                   ▼   │   HTTP/3 CONNECT-IP · mTLS
+            tmasqued (server)
+
+(1) upload   — reads the inner IP packet off the TUN, wraps it in a connect-ip
+               context-0 QUIC DATAGRAM, and sends it to the server.
+(2) download — unwraps a QUIC DATAGRAM from the server and writes the inner
+               IP packet back to the TUN.
 ```
 
 On connect the client receives its address and routes from the server and installs them
@@ -64,12 +60,6 @@ prefixes is steered into the TUN.
   `tcp_wmem`/`tcp_rmem` at bootstrap so a single inner upload isn't send-buffer limited.
 - **MTU.** The TUN MTU is sized to the QUIC datagram payload budget so inner packets never
   exceed it (an over-large MTU silently drops datagrams).
-- **GSO/GRO-capable TUN.** Uses a `water` fork with `IFF_VNET_HDR` + offload split (opt-in via `TUN_GSO`, off by default).
-- **Config & hot-reload.** Keys live in `tmasque.conf`. `LOG_LEVEL` and `ENABLE_STATISTIC`
-  are hot-reloaded on save (inotify); everything else needs a restart. QUIC TLS key logging
-  is off unless `KEY_LOG_PATH` is set (the file and its directory are created on connect).
-  `ENABLE_STATISTIC` emits `[STATISTIC]` diagnostics, opens a pprof/expvar endpoint on
-  `localhost:9484`, and is an independent on/off channel, not a verbosity level.
 
 ---
 
@@ -79,7 +69,7 @@ prefixes is steered into the TUN.
 |---|---|
 | `quic-go` | CC-off-aware dataplane + datagram-queue fixes shared with the server fork. |
 | `connect-ip-go` | IP-packet (context-0) framing for the datagram datapath. |
-| `water` | TUN with `IFF_VNET_HDR` + GSO/GRO offload split. |
+| `water` | TUN with `IFF_VNET_HDR` support. |
 
 ---
 
