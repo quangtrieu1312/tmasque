@@ -9,4 +9,4 @@
 [submodule "lib/water"]
 	path = lib/water
 	url = git@github.com:quangtrieu1312/water
-	branch = master
+	branch = perf/10gbps
